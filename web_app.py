@@ -99,7 +99,7 @@ HTML_TEMPLATE = """
             btn.disabled = true;
             btn.textContent = '生成中，请等待...';
             status.className = 'info';
-            status.textContent = '正在处理，大约需要 1-3 分钟...';
+            status.textContent = '正在处理，视频较长时可能需要十几分钟，请耐心等待...';
             result.style.display = 'none';
 
             try {
@@ -129,8 +129,53 @@ HTML_TEMPLATE = """
 """
 
 task_instance = None
-# Timeout for processing (seconds), prevents infinite hang on queue overflow
-PROCESS_TIMEOUT = 300
+
+
+def write_video(
+    output_imgs_queue,
+    temp_dir,
+    result_dir,
+    work_id,
+    audio_path,
+    result_queue,
+    width,
+    height,
+    fps,
+    watermark_switch=0,
+    digital_auth=0,
+):
+    output_mp4 = os.path.join(temp_dir, "{}-t.mp4".format(work_id))
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    result_path = os.path.join(result_dir, "{}-r.mp4".format(work_id))
+    video_write = cv2.VideoWriter(output_mp4, fourcc, fps, (width, height))
+    try:
+        while True:
+            state, reason, value_ = output_imgs_queue.get()
+            if type(state) == bool and state == True:
+                logger.info(f"VideoWriter [{work_id}] 视频帧队列处理结束")
+                video_write.release()
+                break
+            else:
+                if type(state) == bool and state == False:
+                    logger.error(f"VideoWriter [{work_id}] 异常: {reason}")
+                    raise RuntimeError(reason)
+                for result_img in value_:
+                    video_write.write(result_img)
+        if video_write is not None:
+            video_write.release()
+        command = "ffmpeg -loglevel warning -y -i {} -i {} -c:a aac -c:v libx264 -crf 15 -strict -2 {}".format(
+            audio_path, output_mp4, result_path
+        )
+        subprocess.call(command, shell=True)
+        result_queue.put([True, result_path])
+    except Exception as e:
+        logger.error(f"VideoWriter [{work_id}] 异常: {e}")
+        result_queue.put([False, str(e)])
+    logger.info(f"VideoWriter [{work_id}] 后处理结束")
+
+
+# Replace .so internal write_video with Python version that includes audio muxing
+service.trans_dh_service.write_video = write_video
 
 
 def get_task():
@@ -159,7 +204,7 @@ def get_media_duration(filepath):
 
 def validate_inputs(audio_path, video_path):
     """Pre-validate audio and video before processing.
-    Returns (ok, error_message, warnings).
+    Returns (ok, error_message, warnings, video_duration).
     """
     warnings = []
 
@@ -167,19 +212,19 @@ def validate_inputs(audio_path, video_path):
     video_duration = get_media_duration(video_path)
 
     if audio_duration is None or video_duration is None:
-        return True, None, warnings
+        return True, None, warnings, 0
 
     if audio_duration < 1.0:
-        return False, f"音频时长过短 ({audio_duration:.1f}秒)，至少需要1秒", warnings
+        return False, f"音频时长过短 ({audio_duration:.1f}秒)，至少需要1秒", warnings, 0
 
     if video_duration < 1.0:
-        return False, f"视频时长过短 ({video_duration:.1f}秒)，至少需要1秒", warnings
+        return False, f"视频时长过短 ({video_duration:.1f}秒)，至少需要1秒", warnings, 0
 
-    if audio_duration > 300:
-        return False, f"音频时长过长 ({audio_duration:.0f}秒)，上限300秒", warnings
+    if audio_duration > 600:
+        return False, f"音频时长过长 ({audio_duration:.0f}秒)，上限600秒(10分钟)", warnings, 0
 
-    if video_duration > 300:
-        return False, f"视频时长过长 ({video_duration:.0f}秒)，上限300秒", warnings
+    if video_duration > 600:
+        return False, f"视频时长过长 ({video_duration:.0f}秒)，上限600秒(10分钟)", warnings, 0
 
     ratio = audio_duration / max(video_duration, 0.01)
     if ratio > 3.0:
@@ -194,12 +239,12 @@ def validate_inputs(audio_path, video_path):
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         cap.release()
         if width < 64 or height < 64:
-            return False, f"视频分辨率过低 ({width}x{height})，至少64x64", warnings
+            return False, f"视频分辨率过低 ({width}x{height})，至少64x64", warnings, 0
         if fps < 1 or fps > 120:
-            return False, f"视频帧率异常 ({fps:.1f})", warnings
+            return False, f"视频帧率异常 ({fps:.1f})", warnings, 0
         logger.info(f"Video validated: {width}x{height}, {fps:.1f}fps, {video_duration:.1f}s")
 
-    return True, None, warnings
+    return True, None, warnings, video_duration
 
 
 class ProcessingError(Exception):
@@ -266,7 +311,7 @@ def generate():
     video_file.save(video_path)
 
     try:
-        ok, err_msg, warnings = validate_inputs(audio_path, video_path)
+        ok, err_msg, warnings, video_duration = validate_inputs(audio_path, video_path)
         if not ok:
             shutil.rmtree(upload_dir, ignore_errors=True)
             return jsonify({'success': False, 'error': err_msg})
@@ -279,7 +324,11 @@ def generate():
         code = work_id
         task.task_dic[code] = ""
 
-        run_with_timeout(task, audio_path, video_path, code, PROCESS_TIMEOUT)
+        # Dynamic timeout: video_duration * 15 (covers 7.4x slowdown + buffer), min 5min, max 2hr
+        timeout = max(300, min(int(video_duration * 15), 7200)) if video_duration > 0 else 300
+        logger.info(f"Task {work_id}: video_duration={video_duration:.1f}s, timeout={timeout}s")
+
+        run_with_timeout(task, audio_path, video_path, code, timeout)
 
         task_result = task.task_dic[code]
         if not task_result or len(task_result) < 3 or not task_result[2]:
