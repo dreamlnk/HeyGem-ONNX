@@ -227,4 +227,4 @@ if __name__ == "__main__":
         title=title,
         description=description,
     )
-    demo.queue().launch()
+    demo.queue().launch(server_name="0.0.0.0")

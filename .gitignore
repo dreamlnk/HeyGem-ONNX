@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+*.egg
+venv/
+
+# Models & large files
+*.onnx
+*.pth
+*.pt
+pretrain_models/
+face_detect_utils/resources/
+face_attr_detect/face_attr_epoch_12_220318.onnx
+xseg/xseg_211104_4790000.onnx
+wenet/examples/aishell/aidata/exp/
+
+# Generated output
+*-r.mp4
+*-t.mp4
+*_format.mp4
+*_format.wav
+
+# Logs
+*.log
+log/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp
+result/
+temp/
