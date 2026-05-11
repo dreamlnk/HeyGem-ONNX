@@ -21,11 +21,13 @@ AUDIO_CHUNK_SECONDS = 0.5
 
 
 class TCPStreamingClient:
-    def __init__(self, video_path=None, use_virtualcam=False, loop=False):
+    def __init__(self, video_path=None, use_virtualcam=False, loop=False,
+                 use_mic=False):
         self.running = False
         self.video_path = video_path
         self.loop = loop
         self.use_virtualcam = use_virtualcam
+        self.use_mic = use_mic
         self.latency_history = []
         self.frame_count = 0
         self.sock = None
@@ -153,8 +155,8 @@ class TCPStreamingClient:
         reconnect_interval = 100
         self._connect()
 
-        # 视频模式下,一次性发送全部音频
-        if self.video_path and not audio_queue.empty():
+        # 视频模式下,一次性发送全部音频 (除非用麦克风)
+        if self.video_path and not self.use_mic and not audio_queue.empty():
             audio_data = audio_queue.get()
             self._send_audio(audio_data)
 
@@ -171,7 +173,7 @@ class TCPStreamingClient:
             t0 = time.perf_counter()
 
             # 麦克风模式下持续发送音频
-            if not self.video_path:
+            if self.use_mic or not self.video_path:
                 audio_parts = []
                 while not audio_queue.empty():
                     try:
@@ -248,8 +250,17 @@ class TCPStreamingClient:
                 print(f"虚拟摄像头错误: {e}")
 
         # 音频
-        if self.video_path:
-            audio_ok = True
+        if self.use_mic:
+            # 麦克风驱动嘴型 (可与视频/摄像头组合)
+            audio_ok = False
+            try:
+                import sounddevice
+                print(f"麦克风: {AUDIO_SAMPLE_RATE}Hz (嘴型驱动)")
+                audio_ok = True
+            except ImportError:
+                print("麦克风: 不可用 (pip install sounddevice)")
+        elif self.video_path:
+            audio_ok = True  # 从视频提取
         else:
             audio_ok = False
             try:
@@ -262,13 +273,17 @@ class TCPStreamingClient:
         # 启动线程
         self.running = True
         frame_queue = queue.Queue(maxsize=2)
-        audio_queue = queue.Queue(maxsize=20 if not self.video_path else 1)
+        mic_mode = self.use_mic or not self.video_path
+        audio_queue = queue.Queue(maxsize=20 if mic_mode else 1)
 
         threading.Thread(target=self._capture_loop,
                          args=(cap, frame_queue, fps_video),
                          daemon=True).start()
 
-        if self.video_path:
+        if self.use_mic:
+            threading.Thread(target=self._capture_mic,
+                             args=(audio_queue,), daemon=True).start()
+        elif self.video_path:
             threading.Thread(target=self._capture_audio_from_video,
                              args=(audio_queue,), daemon=True).start()
         elif audio_ok:
@@ -297,6 +312,7 @@ if __name__ == "__main__":
     parser.add_argument("--video", type=str, default=None, help="视频文件路径")
     parser.add_argument("--virtualcam", action="store_true", help="OBS虚拟摄像头输出")
     parser.add_argument("--loop", action="store_true", help="视频循环播放")
+    parser.add_argument("--mic", action="store_true", help="麦克风驱动嘴型(可与视频组合)")
     parser.add_argument("--camera", type=int, default=0, help="摄像头ID")
     args = parser.parse_args()
     if args.video:
@@ -304,4 +320,4 @@ if __name__ == "__main__":
     else:
         CAMERA_ID = args.camera
     TCPStreamingClient(video_path=args.video, use_virtualcam=args.virtualcam,
-                       loop=args.loop).start()
+                       loop=args.loop, use_mic=args.mic).start()
