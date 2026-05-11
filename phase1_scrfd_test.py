@@ -78,8 +78,8 @@ def distance2kps(points, distance, stride):
     """将关键点偏移量解码为绝对坐标"""
     preds = []
     for i in range(0, distance.shape[1], 2):
-        px = points[:, 1] + distance[:, i] * stride
-        py = points[:, 0] + distance[:, i + 1] * stride
+        px = points[:, 0] + distance[:, i]       # cx + dx (already *stride at callsite)
+        py = points[:, 1] + distance[:, i + 1]   # cy + dy
         preds.append(px)
         preds.append(py)
     return np.stack(preds, axis=-1)
