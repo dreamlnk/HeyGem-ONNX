@@ -166,7 +166,8 @@ class DINetInferenceEngine:
 
         print("  加载 DINetV1...")
         self.model = DINetV1(source_channel=3, ref_channel=3, audio_channel=256)
-        torch.serialization.add_safe_globals([np.core.multiarray._reconstruct])
+        if hasattr(torch.serialization, "add_safe_globals"):
+            torch.serialization.add_safe_globals([np.core.multiarray._reconstruct])
         ckpt = torch.load(CKPT_PATH, map_location="cpu", weights_only=False)
         self.model.load_state_dict(ckpt["face_G"], strict=False)
         self.model.eval().cuda()

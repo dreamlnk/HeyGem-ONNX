@@ -33,7 +33,7 @@ def load_session():
         MODEL_PATH, opts,
         providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
     )
-    print(f"设备: {session.get_providers()}")
+    print(f"SCRFD设备: {session.get_providers()}")
     return session
 
 
