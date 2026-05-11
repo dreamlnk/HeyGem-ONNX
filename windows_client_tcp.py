@@ -21,9 +21,10 @@ AUDIO_CHUNK_SECONDS = 0.5
 
 
 class TCPStreamingClient:
-    def __init__(self, video_path=None, use_virtualcam=False):
+    def __init__(self, video_path=None, use_virtualcam=False, loop=False):
         self.running = False
         self.video_path = video_path
+        self.loop = loop
         self.use_virtualcam = use_virtualcam
         self.latency_history = []
         self.frame_count = 0
@@ -90,7 +91,10 @@ class TCPStreamingClient:
         while self.running:
             ret, frame = cap.read()
             if not ret:
-                if self.video_path:
+                if self.video_path and self.loop:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    continue
+                elif self.video_path:
                     break  # 视频结束
                 time.sleep(0.01)
                 continue
@@ -158,7 +162,7 @@ class TCPStreamingClient:
             try:
                 frame = frame_queue.get(timeout=1)
             except queue.Empty:
-                if self.video_path and frame_queue.qsize() == 0:
+                if self.video_path and frame_queue.qsize() == 0 and not self.loop:
                     print("\n视频播放完毕")
                     self.running = False
                     break
@@ -292,10 +296,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--video", type=str, default=None, help="视频文件路径")
     parser.add_argument("--virtualcam", action="store_true", help="OBS虚拟摄像头输出")
+    parser.add_argument("--loop", action="store_true", help="视频循环播放")
     parser.add_argument("--camera", type=int, default=0, help="摄像头ID")
     args = parser.parse_args()
     if args.video:
         CAMERA_ID = None
     else:
         CAMERA_ID = args.camera
-    TCPStreamingClient(video_path=args.video, use_virtualcam=args.virtualcam).start()
+    TCPStreamingClient(video_path=args.video, use_virtualcam=args.virtualcam,
+                       loop=args.loop).start()
