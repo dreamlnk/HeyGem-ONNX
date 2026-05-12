@@ -15,13 +15,15 @@ from phase2_audio_feature import extract_mfcc, prepare_dinet_input, prepare_logm
 
 CKPT_PATH = "landmark2face_wy/checkpoints/anylang/dinet_v1_20240131.pth"
 
-# === 256x256 标准人脸参考点 (ArcFace canonical × 256/112) ===
+# === 256x256 标准人脸参考点 (Dlib对齐, 匹配DINet训练数据) ===
+# 训练数据: {img_size}_dlib_crop + eye mask row 20-70 + mouth mask row ~83-246
+# Dlib标准: 左眼(0.35,0.35)*256, 右眼(0.65,0.35)*256
 REFERENCE_POINTS = np.array([
-    [87.53, 118.16],   # left eye
-    [168.07, 118.16],  # right eye
-    [128.06, 163.97],  # nose
-    [94.97, 211.13],   # left mouth corner
-    [161.67, 211.13],  # right mouth corner
+    [89.60, 89.60],    # left eye
+    [166.40, 89.60],   # right eye
+    [128.00, 132.00],  # nose
+    [89.60, 185.60],   # left mouth corner
+    [166.40, 185.60],  # right mouth corner
 ], dtype=np.float32)
 
 
@@ -59,10 +61,9 @@ def _face_ellipse_mask(size=256):
     基于REFERENCE_POINTS: 眼睛y≈118, 嘴巴y≈211, 鼻子y≈164
     """
     y, x = np.ogrid[:size, :size]
-    # 椭圆中心略偏上 (人脸在256x256中的位置)
-    cx, cy = size / 2, 135
-    # 半轴: 覆盖眼到嘴, 左右留边
-    rx, ry = 85, 110
+    # 椭圆中心匹配dlib对齐 (眼睛y≈90, 嘴巴y≈186)
+    cx, cy = size / 2, 130
+    rx, ry = 90, 115
     ellipse = ((x - cx)**2 / rx**2 + (y - cy)**2 / ry**2) <= 1.0
     mask = ellipse.astype(np.float32)
     # 高斯模糊羽化边缘 (sigma=8 → ~24px过渡带)
@@ -113,16 +114,16 @@ def inverse_affine_transform(img_256, original_frame, M):
 
 
 def create_eye_mask(size=256):
-    """创建眼部遮罩 — 基于REFERENCE_POINTS眼睛y≈118"""
+    """创建额头遮罩 — 匹配DINet训练数据(dlib对齐, mask row 20-70)"""
     mask = np.ones((size, size), dtype=np.uint8) * 255
-    mask[95:145, 55:-55] = 0
+    mask[20:70, 55:-55] = 0
     return mask
 
 
 def create_mouth_mask(size=256):
-    """创建嘴部遮罩 mask_B 风格 — 基于REFERENCE_POINTS鼻子y≈164, 嘴巴y≈211"""
+    """创建下半脸遮罩 mask_B — 匹配DINet训练(dlib对齐, start=128-45, end~246)"""
     mask = np.ones((size, size), dtype=np.uint8) * 255
-    mask[155:246, 30:-30] = 0
+    mask[83:246, 30:-30] = 0
     return mask
 
 
