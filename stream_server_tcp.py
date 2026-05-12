@@ -62,7 +62,7 @@ def handle_client(conn, addr, pipeline):
                 if len(frame_data) != expected:
                     continue
 
-                frame = np.frombuffer(frame_data, dtype=np.uint8).reshape(h, w, 3)
+                frame = np.frombuffer(frame_data, dtype=np.uint8).reshape(h, w, 3).copy()
                 result = pipeline.process_frame(frame)
                 result_bytes = result.tobytes()
                 conn.sendall(struct.pack("<I", len(result_bytes)) + result_bytes)
