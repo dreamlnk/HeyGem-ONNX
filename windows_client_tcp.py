@@ -22,12 +22,15 @@ AUDIO_CHUNK_SECONDS = 0.5
 
 class TCPStreamingClient:
     def __init__(self, video_path=None, use_virtualcam=False, loop=False,
-                 use_mic=False):
+                 use_mic=False, portrait=False):
         self.running = False
         self.video_path = video_path
         self.loop = loop
         self.use_virtualcam = use_virtualcam
         self.use_mic = use_mic
+        self.portrait = portrait
+        self.width = WIDTH
+        self.height = HEIGHT
         self.latency_history = []
         self.frame_count = 0
         self.sock = None
@@ -54,13 +57,15 @@ class TCPStreamingClient:
             if self.sock is None:
                 return None
             try:
-                data = frame_bgr.tobytes()
+                h, w = frame_bgr.shape[:2]
+                wh = struct.pack("<HH", w, h)
+                data = wh + frame_bgr.tobytes()
                 hdr = struct.pack("<BI", 0, len(data))
                 self.sock.sendall(hdr + data)
                 result_len = struct.unpack("<I", self._recv_exact(4))[0]
-                if result_len > 0 and result_len == FRAME_SIZE:
+                if result_len > 0:
                     return np.frombuffer(self._recv_exact(result_len),
-                                         dtype=np.uint8).reshape(HEIGHT, WIDTH, 3)
+                                         dtype=np.uint8).reshape(h, w, 3)
             except Exception:
                 self.sock = None
                 return None
@@ -101,7 +106,7 @@ class TCPStreamingClient:
                 time.sleep(0.01)
                 continue
 
-            frame = cv2.resize(frame, (WIDTH, HEIGHT))
+            frame = cv2.resize(frame, (self.width, self.height))
 
             # 视频模式保持原始帧率
             if frame_delay > 0:
@@ -224,16 +229,24 @@ class TCPStreamingClient:
             cap = cv2.VideoCapture(self.video_path)
             fps_video = cap.get(cv2.CAP_PROP_FPS)
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            print(f"视频: {os.path.basename(self.video_path)} ({total_frames}帧 @ {fps_video:.0f}fps)")
+            vw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            vh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            print(f"视频: {os.path.basename(self.video_path)} ({total_frames}帧 @ {fps_video:.0f}fps, {vw}x{vh})")
         else:
             cap = cv2.VideoCapture(CAMERA_ID)
             if not cap.isOpened():
                 print("ERROR: 无法打开摄像头")
                 return
             fps_video = None
+            vw, vh = WIDTH, HEIGHT
             print(f"摄像头 #{CAMERA_ID}")
 
-        print(f"分辨率: {WIDTH}x{HEIGHT}")
+        # 输出分辨率: 竖屏自动切换或 --portrait 强制
+        if self.portrait or (self.video_path and vh > vw):
+            self.width, self.height = 720, 1280
+        else:
+            self.width, self.height = WIDTH, HEIGHT
+        print(f"输出: {self.width}x{self.height}")
 
         # 虚拟摄像头
         cam_output = None
@@ -241,9 +254,9 @@ class TCPStreamingClient:
             try:
                 import pyvirtualcam
                 out_fps = int(fps_video) if fps_video else 25
-                cam_output = pyvirtualcam.Camera(width=WIDTH, height=HEIGHT, fps=out_fps,
+                cam_output = pyvirtualcam.Camera(width=self.width, height=self.height, fps=out_fps,
                                                   fmt=pyvirtualcam.PixelFormat.RGB)
-                print(f"虚拟摄像头: {WIDTH}x{HEIGHT} @{out_fps}fps")
+                print(f"虚拟摄像头: {self.width}x{self.height} @{out_fps}fps")
             except ImportError:
                 print("pyvirtualcam 未安装，使用预览窗口")
             except Exception as e:
@@ -313,6 +326,7 @@ if __name__ == "__main__":
     parser.add_argument("--virtualcam", action="store_true", help="OBS虚拟摄像头输出")
     parser.add_argument("--loop", action="store_true", help="视频循环播放")
     parser.add_argument("--mic", action="store_true", help="麦克风驱动嘴型(可与视频组合)")
+    parser.add_argument("--portrait", action="store_true", help="竖屏输出 720x1280")
     parser.add_argument("--camera", type=int, default=0, help="摄像头ID")
     args = parser.parse_args()
     if args.video:
@@ -320,4 +334,5 @@ if __name__ == "__main__":
     else:
         CAMERA_ID = args.camera
     TCPStreamingClient(video_path=args.video, use_virtualcam=args.virtualcam,
-                       loop=args.loop, use_mic=args.mic).start()
+                       loop=args.loop, use_mic=args.mic,
+                       portrait=args.portrait).start()

@@ -9,7 +9,6 @@ sys.path.insert(0, os.path.dirname(__file__))
 from pipeline_complete import StreamingPipeline
 
 PORT = 7862
-FRAME_SIZE = 1280 * 720 * 3  # BGR
 
 
 def recv_exact(sock, n):
@@ -52,10 +51,18 @@ def handle_client(conn, addr, pipeline):
                 continue
 
             elif msg_type == 0:  # 帧
-                if payload_len != FRAME_SIZE:
-                    continue  # 尺寸不对,跳过
+                # 新协议: [type=0][2B width LE][2B height LE][payload]
+                # payload_len = width * height * 3
+                if payload_len < 4:
+                    continue
+                w = struct.unpack("<H", payload[0:2])[0]
+                h = struct.unpack("<H", payload[2:4])[0]
+                frame_data = payload[4:]
+                expected = w * h * 3
+                if len(frame_data) != expected:
+                    continue
 
-                frame = np.frombuffer(payload, dtype=np.uint8).reshape(720, 1280, 3)
+                frame = np.frombuffer(frame_data, dtype=np.uint8).reshape(h, w, 3)
                 result = pipeline.process_frame(frame)
                 result_bytes = result.tobytes()
                 conn.sendall(struct.pack("<I", len(result_bytes)) + result_bytes)
