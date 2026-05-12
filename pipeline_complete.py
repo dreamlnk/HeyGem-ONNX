@@ -11,7 +11,7 @@ import librosa
 sys.path.insert(0, os.path.dirname(__file__))
 
 from phase1_scrfd_test import load_session as scrfd_load, detect as scrfd_detect
-from phase2_audio_feature import extract_mfcc, prepare_dinet_input
+from phase2_audio_feature import extract_mfcc, prepare_dinet_input, prepare_logmel_dinet_input, sr_samples
 
 CKPT_PATH = "landmark2face_wy/checkpoints/anylang/dinet_v1_20240131.pth"
 
@@ -55,13 +55,16 @@ def align_face(img_bgr, kps, target_size=256, ref_pts=REFERENCE_POINTS):
 
 
 def inverse_affine_transform(img_256, original_frame, M, mouth_mask=None):
-    """
-    将DINet输出(256x256)逆变换贴回原始帧 (仅处理人脸ROI区域)
-    """
+    """将DINet输出(256x256)逆变换贴回原始帧"""
     h, w = original_frame.shape[:2]
-    M_inv = cv2.invertAffineTransform(M)
 
-    # 计算256x256四个角映射回原始帧的位置，确定ROI
+    # 遮罩白色背景: 面部内容通常在中间, 四角为白色背景
+    gray = cv2.cvtColor(img_256, cv2.COLOR_BGR2GRAY)
+    bg_mask = gray < 240
+    masked_256 = img_256.copy()
+    masked_256[~bg_mask] = 0
+
+    M_inv = cv2.invertAffineTransform(M)
     corners_256 = np.array([[0, 0], [255, 0], [255, 255], [0, 255]], dtype=np.float32)
     corners_orig = cv2.transform(corners_256.reshape(1, -1, 2), M_inv).reshape(-1, 2)
 
@@ -74,88 +77,79 @@ def inverse_affine_transform(img_256, original_frame, M, mouth_mask=None):
     if roi_w <= 0 or roi_h <= 0:
         return original_frame
 
-    # 调整M_inv只作用于ROI区域
     M_roi = M_inv.copy()
     M_roi[0, 2] -= x_min
     M_roi[1, 2] -= y_min
 
-    # 只在ROI内做warp
-    warped_roi = cv2.warpAffine(img_256, M_roi, (roi_w, roi_h),
+    warped_roi = cv2.warpAffine(masked_256, M_roi, (roi_w, roi_h),
                                 flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_TRANSPARENT)
+
+    # 同时warp遮罩以排除边缘伪影
+    warped_mask = cv2.warpAffine(bg_mask.astype(np.uint8) * 255, M_roi, (roi_w, roi_h),
+                                 flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_TRANSPARENT)
 
     result = original_frame.copy()
     roi = result[y_min:y_max, x_min:x_max]
 
-    # 只覆盖warped中有内容的部分
-    valid = (warped_roi.sum(axis=2) > 0)
-    roi[valid] = warped_roi[valid]
+    valid = warped_mask > 128
+    for c in range(3):
+        roi_c = roi[:, :, c]
+        roi_c[valid] = warped_roi[:, :, c][valid]
     result[y_min:y_max, x_min:x_max] = roi
 
     return result
 
 
 def create_eye_mask(size=256):
-    """创建眼部遮罩 (训练时遮眼睛区域，推理时取消)"""
+    """创建眼部遮罩 — 基于REFERENCE_POINTS眼睛y≈118"""
     mask = np.ones((size, size), dtype=np.uint8) * 255
-    mask[20:70, 55:-55] = 0
+    mask[95:145, 55:-55] = 0
     return mask
 
 
 def create_mouth_mask(size=256):
-    """创建嘴部遮罩 mask_B 风格 (下半脸区域)"""
+    """创建嘴部遮罩 mask_B 风格 — 基于REFERENCE_POINTS鼻子y≈164, 嘴巴y≈211"""
     mask = np.ones((size, size), dtype=np.uint8) * 255
-    half = size // 2  # 128
-    mask[half - 45:246, 30:-30] = 0
+    mask[155:246, 30:-30] = 0
     return mask
 
 
 def preprocess_face_for_dinet(aligned_bgr, apply_eye_mask=True):
     """
-    对齐人脸 → DINet输入格式
-    Args:
-        aligned_bgr: [256, 256, 3] BGR对齐人脸
-        apply_eye_mask: 是否遮眼睛 (source/ref需要, mask_B不需要)
-    Returns:
-        tensor: [3, 256, 256] 归一化到[-1, 1]
+    对齐人脸 → DINet输入格式 (保持BGR, DINet训练时使用OpenCV BGR)
     """
-    img_rgb = cv2.cvtColor(aligned_bgr, cv2.COLOR_BGR2RGB)
+    img = aligned_bgr.copy()
     if apply_eye_mask:
         eye_mask = create_eye_mask()
-        img_rgb = cv2.bitwise_and(img_rgb, img_rgb, mask=eye_mask)
+        img = cv2.bitwise_and(img, img, mask=eye_mask)
     # 归一化到 [-1, 1]: (x/255 - 0.5) / 0.5
-    tensor = torch.from_numpy(img_rgb).float().permute(2, 0, 1) / 255.0
+    tensor = torch.from_numpy(img).float().permute(2, 0, 1) / 255.0
     tensor = (tensor - 0.5) / 0.5
     return tensor
 
 
 def preprocess_mask_B_for_dinet(aligned_bgr):
     """
-    创建mask_B: 对齐人脸 + 嘴部遮罩 (DINet输入中的参考遮罩)
+    创建mask_B: 对齐人脸 + 嘴部遮罩 (保持BGR)
     """
-    img_rgb = cv2.cvtColor(aligned_bgr, cv2.COLOR_BGR2RGB)
+    img = aligned_bgr.copy()
     mouth_mask = create_mouth_mask()
-    # 嘴部区域置0
-    img_rgb = cv2.bitwise_and(img_rgb, img_rgb, mask=mouth_mask)
-    tensor = torch.from_numpy(img_rgb).float().permute(2, 0, 1) / 255.0
+    img = cv2.bitwise_and(img, img, mask=mouth_mask)
+    tensor = torch.from_numpy(img).float().permute(2, 0, 1) / 255.0
     tensor = (tensor - 0.5) / 0.5
     return tensor
 
 
 def denormalize_output(tensor):
     """
-    DINet输出 [-1, 1] → uint8 BGR
-    Args:
-        tensor: [1, 3, 256, 256] 或 [3, 256, 256]
-    Returns:
-        img_bgr: [256, 256, 3] uint8
+    DINet输出 [0, 1] → uint8 BGR (模型输出BGR, 无需转换)
     """
     if tensor.dim() == 4:
         tensor = tensor.squeeze(0)
-    img = tensor.float().clamp(-1, 1).cpu().numpy()
-    img = img.transpose(1, 2, 0)  # CHW → HWC
-    img = ((img * 0.5 + 0.5) * 255).astype(np.uint8)
-    img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-    return img_bgr
+    img = tensor.float().cpu().numpy()
+    img = np.clip(img, 0, 1).transpose(1, 2, 0)  # CHW → HWC
+    img = (img * 255).astype(np.uint8)
+    return img
 
 
 class DINetInferenceEngine:
@@ -169,6 +163,18 @@ class DINetInferenceEngine:
         if hasattr(torch.serialization, "add_safe_globals"):
             torch.serialization.add_safe_globals([np.core.multiarray._reconstruct])
         ckpt = torch.load(CKPT_PATH, map_location="cpu", weights_only=False)
+        model_state = self.model.state_dict()
+        ckpt_state = ckpt["face_G"]
+        missing = set(model_state.keys()) - set(ckpt_state.keys())
+        extra = set(ckpt_state.keys()) - set(model_state.keys())
+        matching = set(model_state.keys()) & set(ckpt_state.keys())
+        if missing:
+            print(f"  [WARN] 缺失权重: {len(missing)} keys (strict=False会跳过)")
+            for k in sorted(missing)[:5]:
+                print(f"    - {k}")
+        if extra:
+            print(f"  [INFO] 多余权重: {len(extra)} keys")
+        print(f"  [INFO] 匹配权重: {len(matching)}/{len(model_state)} keys")
         self.model.load_state_dict(ckpt["face_G"], strict=False)
         self.model.eval().cuda()
         print(f"  DINetV1 已加载, 显存: {torch.cuda.memory_allocated()/1024**3:.1f}GB")
@@ -201,7 +207,7 @@ class DINetInferenceEngine:
 class StreamingPipeline:
     """完整流式管线"""
 
-    def __init__(self, detect_interval=3):
+    def __init__(self, detect_interval=3, test_audio=False):
         print("=" * 60)
         print("初始化完整流式管线")
         print("=" * 60)
@@ -217,10 +223,22 @@ class StreamingPipeline:
         print("  GPU warmup...")
         self._warmup()
 
-        # 音频缓冲
+        # 音频缓冲 + 对数梅尔谱特征提取
         self.audio_buffer = np.array([], dtype=np.float32)
         self.audio_lock = threading.Lock()
+        self.dinet_lock = threading.Lock()  # DINet CUDA推理锁 (防止多客户端并发覆盖共享tensor)
         self.latest_audio_feat = None
+        self._last_rendered = None
+        self.test_audio = test_audio
+
+        # 预加载对数梅尔谱模块
+        print("  加载对数梅尔谱提取...")
+        try:
+            from phase2_audio_feature import _get_wm
+            _get_wm()
+            print("  对数梅尔谱提取就绪 ✓")
+        except Exception as e:
+            print(f"  [警告] 加载失败: {e}")
 
         # 人脸状态
         self.source_face_tensor = None  # 身份参考帧 (固定)
@@ -240,9 +258,12 @@ class StreamingPipeline:
 
     def _warmup(self):
         """GPU warmup消除首次推理延迟"""
+        # YuNet warmup
+        dummy = np.ones((640, 640, 3), dtype=np.uint8) * 128
         for _ in range(3):
-            self.scrfd.run(None, {self.scrfd.get_inputs()[0].name:
-                            np.random.randn(1, 3, 640, 640).astype(np.float32)})
+            self.scrfd.setInputSize((640, 640))
+            self.scrfd.detect(dummy)
+        # DINet warmup
         src = torch.randn(1, 3, 256, 256).cuda()
         ref = torch.randn(1, 3, 256, 256).cuda()
         audio = torch.randn(1, 256, 256).cuda()
@@ -260,56 +281,107 @@ class StreamingPipeline:
     def process_frame(self, frame_bgr, profile=False):
         """处理单帧"""
         self.frame_idx += 1
-        t0 = time.perf_counter() if profile else 0
 
         # 1. 人脸检测 (跳帧)
         do_detect = (self.frame_idx % self.detect_interval == 0) or (self.last_bbox is None)
         if do_detect:
-            bboxes, kpss, meta = scrfd_detect(self.scrfd, frame_bgr)
-            if len(bboxes) > 0:
-                self.last_bbox = bboxes[0]
-                self.last_kps = kpss[0] if len(kpss) > 0 else None
+            bboxes, kpss, _ = scrfd_detect(self.scrfd, frame_bgr)
+
+            valid_found = False
+            for i, bbox in enumerate(bboxes):
+                kps_i = kpss[i] if i < len(kpss) else None
+                if self._valid_detection(bbox, kps_i, frame_bgr) and self._has_skin(frame_bgr, bbox):
+                    self.last_bbox = bbox
+                    self.last_kps = kps_i
+                    valid_found = True
+                    break
+            if not valid_found:
+                self.last_bbox = None
+                self.last_kps = None
 
         if self.last_bbox is None:
             return frame_bgr
 
-        # 2. 人脸对齐 (复用关键点直到下次检测)
-        if self.last_kps is not None:
-            aligned_face, M = align_face(frame_bgr, self.last_kps)
-            if aligned_face is not None:
-                self.last_M = M
-            else:
-                return frame_bgr
-        else:
+        if not self._valid_detection(self.last_bbox, self.last_kps, frame_bgr):
+            self.last_bbox = None
+            self.last_kps = None
             return frame_bgr
 
+        # 2. 人脸对齐
+        if self.last_kps is None:
+            return frame_bgr
+
+        aligned_face, M = align_face(frame_bgr, self.last_kps)
+        if aligned_face is None:
+            return frame_bgr
+        self.last_M = M
+
         # 3. 设置身份参考帧 (第一帧)
-        if self.source_face_tensor is None and self.last_kps is not None:
+        if self.source_face_tensor is None:
             self.set_source_face(frame_bgr, self.last_bbox, self.last_kps)
 
         # 4. 准备DINet输入
         if self.source_face_tensor is None or self.latest_audio_feat is None:
-            return self._draw_debug(frame_bgr)
+            return frame_bgr
 
-        ref_tensor = preprocess_face_for_dinet(aligned_face, apply_eye_mask=True)
+        ref_tensor = preprocess_mask_B_for_dinet(aligned_face)
 
         # 5. DINet推理
-        rendered_256 = self.dinet.infer(
-            self.source_face_tensor,
-            ref_tensor,
-            self.latest_audio_feat,
-        )
+        with self.dinet_lock:
+            rendered_256 = self.dinet.infer(
+                self.source_face_tensor,
+                ref_tensor,
+                self.latest_audio_feat,
+            )
 
         # 6. 合成回原始帧
         result = inverse_affine_transform(rendered_256, frame_bgr, self.last_M)
 
-        # 7. 画检测框 (调试用)
-        result = self._draw_debug(result)
+        return result
 
-        if profile and self.frame_idx % 30 == 0:
-            total = (time.perf_counter() - t0) * 1000
-            print(f"  [Profile #{self.frame_idx}] total={total:.0f}ms")
+    def _valid_detection(self, bbox, kps, frame):
+        """过滤虚假检测: bbox必须至少部分在画面内且尺寸合理"""
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = bbox
+        bw, bh = x2 - x1, y2 - y1
+        # bbox必须至少部分在画面内 (x2>0, x1<w)
+        if x2 < 1 or x1 > w - 1 or y2 < 1 or y1 > h - 1:
+            import sys as _sys
+            print(f"[VALIDATE] REJECT boundary: bbox={bbox} frame={w}x{h}", flush=True, file=_sys.stderr)
+            return False
+        # 尺寸合理: 20~120%画面尺寸
+        if bw < 20 or bh < 20 or bw > w * 1.2 or bh > h * 1.2:
+            import sys as _sys
+            print(f"[VALIDATE] REJECT size: bbox={bbox} bw={bw} bh={bh} frame={w}x{h} limit_w={w*1.2:.0f} limit_h={h*1.2:.0f}", flush=True, file=_sys.stderr)
+            return False
+        # bbox不能是退化的 (x1 >= x2 or y1 >= y2)
+        if bw <= 0 or bh <= 0:
+            return False
+        if kps is not None:
+            if kps.ndim == 1:
+                kps = kps.reshape(-1, 2)
+            for kp in kps:
+                if not (-w < kp[0] < 2*w and -h < kp[1] < 2*h):
+                    import sys as _sys
+                    print(f"[VALIDATE] REJECT kps: kp={kp} frame={w}x{h}", flush=True, file=_sys.stderr)
+                    return False
+        return True
 
+    def _has_skin(self, frame_bgr, bbox):
+        """验证检测框内是否包含足够比例的肤色像素"""
+        import sys as _sys
+        x1, y1, x2, y2 = bbox.astype(int)
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(frame_bgr.shape[1], x2), min(frame_bgr.shape[0], y2)
+        if x2 - x1 < 5 or y2 - y1 < 5:
+            return False
+        roi = frame_bgr[y1:y2, x1:x2]
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        skin = cv2.inRange(hsv, (0, 15, 50), (25, 180, 255))
+        ratio = skin.sum() / 255 / (roi.shape[0] * roi.shape[1])
+        result = ratio > 0.05
+        if not result:
+            print(f"[SKIN] REJECT: skin_ratio={ratio:.3f} bbox={bbox}", flush=True, file=_sys.stderr)
         return result
 
     def _draw_debug(self, frame):
@@ -324,16 +396,35 @@ class StreamingPipeline:
         return frame
 
     def feed_audio(self, audio_chunk, sample_rate=16000):
-        """喂入音频"""
+        """喂入音频 → 对数梅尔谱 → DINet [256,256]"""
         with self.audio_lock:
             self.audio_buffer = np.concatenate([self.audio_buffer, audio_chunk])
-            max_samples = sample_rate * 5  # 保留最近5秒
+            max_samples = sample_rate * 10  # 保留最近10秒
             if len(self.audio_buffer) > max_samples:
                 self.audio_buffer = self.audio_buffer[-max_samples:]
 
             if len(self.audio_buffer) >= sample_rate * 0.5:
-                features = extract_mfcc(self.audio_buffer)
-                self.latest_audio_feat = prepare_dinet_input(features)
+                self.latest_audio_feat = prepare_logmel_dinet_input(self.audio_buffer)
+                if self.frame_idx % 15 == 0:
+                    f = self.latest_audio_feat
+                    roi = f[:, :80]
+                    nz = roi[roi != 0]
+                    print(f"\r[音频特征] shape={f.shape} 非零区域: mean={nz.mean():.1f} std={nz.std():.1f} "
+                          f"min={nz.min():.1f} max={nz.max():.1f} count={len(nz)}",
+                          flush=True, file=__import__('sys').stderr)
+
+    def feed_test_audio(self):
+        """极端测试: 交替两种完全不同的音频特征，验证DINet嘴型变化"""
+        import math
+        t = self.frame_idx
+        # 每30帧切换一次特征模式 (模拟开/闭嘴)
+        if (t // 30) % 2 == 0:
+            # "张嘴"特征: 全1
+            feat = np.ones((256, 256), dtype=np.float32)
+        else:
+            # "闭嘴"特征: 全0
+            feat = np.zeros((256, 256), dtype=np.float32)
+        self.latest_audio_feat = feat
 
     def start(self):
         self.running = True

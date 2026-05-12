@@ -24,7 +24,14 @@ def recv_exact(sock, n):
 
 def handle_client(conn, addr, pipeline):
     """处理单个客户端连接"""
-    print(f"[连接] {addr}")
+    print(f"[连接] {addr}", flush=True)
+    # 每个新客户端重置状态
+    pipeline.source_face_tensor = None
+    pipeline.last_bbox = None
+    pipeline.last_kps = None
+    pipeline.last_M = None
+    pipeline._debug_saved = 0
+    pipeline._prev_mouth = None
     try:
         while True:
             # 读取类型标记
@@ -41,6 +48,7 @@ def handle_client(conn, addr, pipeline):
                 audio_np = np.frombuffer(payload, dtype=np.float32).copy()
                 if len(audio_np) > 0:
                     pipeline.feed_audio(audio_np)
+                    print(f"\r[音频] {len(audio_np)}样点, max={audio_np.max():.3f}, std={audio_np.std():.3f}  ", end="", flush=True)
                 # 音频不回复
                 continue
 
@@ -70,36 +78,50 @@ def handle_client(conn, addr, pipeline):
     except (ConnectionError, ConnectionResetError, struct.error):
         pass
     except Exception as e:
+        import traceback as _tb
         print(f"[错误] {addr}: {e}")
+        _tb.print_exc()
     finally:
         conn.close()
-        print(f"[断开] {addr}")
+        print(f"[断开] {addr}", flush=True)
 
 
 def main():
-    print("=" * 60)
-    print("HeyGem TCP 流式服务端")
-    print("=" * 60)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--test-audio", action="store_true", help="使用振荡测试音频验证唇形")
+    args = parser.parse_args()
 
-    print("初始化管线...")
-    pipeline = StreamingPipeline(detect_interval=5)
+    print("=" * 60, flush=True)
+    print("HeyGem TCP 流式服务端", flush=True)
+    print("=" * 60, flush=True)
+
+    print("初始化管线...", flush=True)
+    pipeline = StreamingPipeline(detect_interval=5, test_audio=args.test_audio)
     pipeline.start()
     # 预初始化音频特征 (避免首次帧跳过DINet)
-    pipeline.latest_audio_feat = np.zeros((256, 256), dtype=np.float32)
-    print("管线就绪")
+    if args.test_audio:
+        pipeline.feed_test_audio()
+    else:
+        pipeline.latest_audio_feat = np.zeros((256, 256), dtype=np.float32)
+    print(f"管线就绪 (test_audio={args.test_audio})", flush=True)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("0.0.0.0", PORT))
-    sock.listen(2)
-    print(f"监听端口 {PORT}...")
+    sock.listen(1)
+    print(f"监听端口 {PORT}...", flush=True)
 
     try:
         while True:
             conn, addr = sock.accept()
+            with open("/tmp/heygem_accept.log", "a") as f:
+                f.write(f"[ACCEPT] {addr}\n")
+            print(f"[ACCEPT] {addr}", flush=True)
             t = threading.Thread(target=handle_client, args=(conn, addr, pipeline),
                                  daemon=True)
             t.start()
+            t.join()  # 等待客户端断开再接受下一个
     except KeyboardInterrupt:
         print("\n停止服务")
     finally:

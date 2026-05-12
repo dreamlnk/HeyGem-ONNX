@@ -1,6 +1,6 @@
 """
-Phase 2b: 音频特征提取 (MFCC)
-用于实时流式音频特征提取，替代 wenet ASR 批处理方案
+Phase 2b: 音频特征提取 (对数梅尔谱)
+用于实时流式音频特征提取
 """
 import os
 import time
@@ -134,3 +134,55 @@ if __name__ == "__main__":
         print(f"  DINet输入: {dinet_inp.shape}")
 
     print("\nPhase 2b 完成 ✓")
+
+
+# === 对数梅尔谱特征提取 (DINet原生训练特征) ===
+# DINet的BatchNorm统计显示训练特征均值为-10~-77, 方差16~1535
+# wav2mfcc_v2的对数梅尔谱(mean≈-67, std≈10)最接近训练分布
+# 使用该特征可产生9px嘴部变化, 而WeNet编码器输出仅有0.08px
+
+_WM = None  # compute_ctc_att_bnf模块缓存
+
+def _get_wm():
+    global _WM
+    if _WM is None:
+        import sys as _sys
+        _sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'wenet'))
+        import compute_ctc_att_bnf as _w
+        _WM = _w
+    return _WM
+
+
+def extract_log_mel(audio_np):
+    """wav2mfcc_v2: numpy音频 → 对数梅尔谱 [T, 80] (float64)"""
+    wm = _get_wm()
+    audio_f64 = audio_np.astype(np.float64)
+    log_mel, _ = wm.wav2mfcc_v2(audio_f64)
+    return log_mel  # [T, 80], range ~[-70, -15]
+
+
+def prepare_logmel_dinet_input(audio_np, target_len=TARGET_LEN):
+    """一站式: numpy音频 → 对数梅尔谱 → [256, 256] DINet输入"""
+    if len(audio_np) < 800:  # <50ms
+        return np.zeros((target_len, target_len), dtype=np.float32)
+
+    log_mel = extract_log_mel(audio_np)  # [T, 80], float64
+    T, D = log_mel.shape
+
+    # 时间维度: 截断/填充到 target_len
+    # 保留最后N帧 (最新音频), 而非前N帧 (旧音频)
+    if T > target_len:
+        log_mel = log_mel[-target_len:, :]
+    else:
+        pad = np.zeros((target_len - T, D), dtype=np.float64)
+        log_mel = np.concatenate([log_mel, pad], axis=0)
+
+    # 特征维度: 80 → 256 (补零)
+    feat = np.zeros((target_len, target_len), dtype=np.float32)
+    feat[:, :D] = log_mel.astype(np.float32)
+
+    return feat
+
+
+def sr_samples(seconds, sr=SAMPLE_RATE):
+    return int(seconds * sr)

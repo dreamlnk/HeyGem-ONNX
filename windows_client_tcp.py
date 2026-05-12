@@ -11,7 +11,7 @@ import numpy as np
 import cv2
 
 # === 配置 ===
-WSL_HOST = "127.0.0.1"
+WSL_HOST = "192.168.82.30"
 WSL_PORT = 7862
 WIDTH, HEIGHT = 1280, 720
 FRAME_SIZE = WIDTH * HEIGHT * 3
@@ -22,12 +22,13 @@ AUDIO_CHUNK_SECONDS = 0.5
 
 class TCPStreamingClient:
     def __init__(self, video_path=None, use_virtualcam=False, loop=False,
-                 use_mic=False, portrait=False):
+                 use_mic=False, portrait=False, obs_win=False):
         self.running = False
         self.video_path = video_path
         self.loop = loop
         self.use_virtualcam = use_virtualcam
         self.use_mic = use_mic
+        self.obs_win = obs_win
         self.portrait = portrait
         self.width = WIDTH
         self.height = HEIGHT
@@ -65,7 +66,7 @@ class TCPStreamingClient:
                 result_len = struct.unpack("<I", self._recv_exact(4))[0]
                 if result_len > 0:
                     return np.frombuffer(self._recv_exact(result_len),
-                                         dtype=np.uint8).reshape(h, w, 3)
+                                         dtype=np.uint8).reshape(h, w, 3).copy()
             except Exception:
                 self.sock = None
                 return None
@@ -89,6 +90,28 @@ class TCPStreamingClient:
                 raise ConnectionError()
             buf.extend(chunk)
         return bytes(buf)
+
+    def _setup_obs_window(self):
+        """创建OBS可捕获的干净窗口 (无边框, 置顶, 可指定位置)"""
+        import ctypes
+        self._obs_win_name = "HeyGem_OBS"
+        cv2.namedWindow(self._obs_win_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(self._obs_win_name, self.width, self.height)
+        # 窗口置顶
+        hwnd = ctypes.windll.user32.FindWindowW(None, self._obs_win_name)
+        if hwnd:
+            GWL_STYLE = -16
+            WS_CAPTION = 0x00C00000
+            WS_THICKFRAME = 0x00040000
+            style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_STYLE)
+            style &= ~(WS_CAPTION | WS_THICKFRAME)
+            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_STYLE, style)
+            HWND_TOPMOST = -1
+            SWP_NOMOVE = 0x0002
+            SWP_NOSIZE = 0x0001
+            ctypes.windll.user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                                              SWP_NOMOVE | SWP_NOSIZE)
+            print(f"OBS窗口已创建: 无边框, 置顶 ({self.width}x{self.height})")
 
     def _capture_loop(self, cap, frame_queue, video_fps=None):
         """通用采集线程: 摄像头或视频文件"""
@@ -124,20 +147,31 @@ class TCPStreamingClient:
     def _capture_audio_from_video(self, audio_queue):
         """从视频文件提取音频并发送"""
         try:
-            audio_path = os.path.join(os.path.dirname(self.video_path),
-                                      "_temp_audio.wav")
-            import subprocess
+            import tempfile, subprocess, os as _os
+            # 先检查视频是否有音频流
+            probe = subprocess.run(
+                f'ffprobe -v error -select_streams a:0 -show_entries stream=codec_type '
+                f'-of default=noprint_wrappers=1:nokey=1 "{self.video_path}"',
+                shell=True, capture_output=True, timeout=10,
+            )
+            if b"audio" not in probe.stdout:
+                print("  视频无音频流，跳过音频")
+                return
+            audio_path = _os.path.join(tempfile.gettempdir(), "_heygem_audio.wav")
             subprocess.run(
                 f'ffmpeg -y -i "{self.video_path}" -ac 1 -ar {AUDIO_SAMPLE_RATE} '
                 f'-t 60 "{audio_path}"',
-                shell=True, capture_output=True,
+                shell=True, capture_output=True, timeout=30,
             )
+            if not _os.path.exists(audio_path) or _os.path.getsize(audio_path) == 0:
+                print("  音频提取失败: 输出文件为空")
+                return
             import librosa
             audio, sr = librosa.load(audio_path, sr=AUDIO_SAMPLE_RATE, mono=True)
             # 一次性发送全部音频
             audio_queue.put(audio.astype(np.float32))
             print(f"  视频音频已提取: {len(audio)/sr:.0f}s")
-            os.remove(audio_path)
+            _os.remove(audio_path)
         except Exception as e:
             print(f"  音频提取失败: {e}")
 
@@ -145,30 +179,67 @@ class TCPStreamingClient:
         """麦克风采集"""
         try:
             import sounddevice as sd
+        except ImportError:
+            print("  [错误] sounddevice 未安装")
+            return
+        try:
+            devices = sd.query_devices()
+            mic_id = None
+            # DirectSound BOYA 设备 (共享模式, 不冲突OBS)
+            for i, d in enumerate(devices):
+                if d['max_input_channels'] > 0 and 'BOYA' in d['name'] and 'DirectSound' in str(d):
+                    mic_id = i
+                    break
+            if mic_id is None:
+                # 任意BOYA
+                for i, d in enumerate(devices):
+                    if d['max_input_channels'] > 0 and 'BOYA' in d['name']:
+                        mic_id = i
+                        break
+            if mic_id is None:
+                mic_id = sd.default.device[0]
+            dev_info = sd.query_devices(mic_id)
+            dev_sr = int(dev_info['default_samplerate'])
+            print(f"  麦克风: [{mic_id}] {dev_info['name']} {dev_sr}Hz")
+            gain = 8.0
+            import librosa
+            chunk_count = 0
             while self.running:
-                chunk = sd.rec(int(AUDIO_SAMPLE_RATE * AUDIO_CHUNK_SECONDS),
-                               samplerate=AUDIO_SAMPLE_RATE, channels=1,
-                               dtype="float32", blocking=True)
+                chunk = sd.rec(int(dev_sr * AUDIO_CHUNK_SECONDS),
+                              samplerate=dev_sr, channels=1,
+                              dtype="float32", blocking=True, device=mic_id)
+                # 重采样到16kHz + 增益
+                chunk_16k = librosa.resample(chunk.flatten(), orig_sr=dev_sr, target_sr=AUDIO_SAMPLE_RATE)
+                chunk_16k = np.clip(chunk_16k * gain, -1.0, 1.0).astype(np.float32)
+                level_max = float(np.abs(chunk_16k).max())
+                level_std = float(chunk_16k.std())
+                chunk_count += 1
+                if chunk_count % 3 == 0:
+                    print(f"\r  [MIC] max={level_max:.4f} std={level_std:.4f} {'<<<' if level_max > 0.05 else '(silent)'}  ", end="")
                 try:
-                    audio_queue.put_nowait(chunk.flatten())
+                    audio_queue.put_nowait(chunk_16k)
                 except queue.Full:
                     pass
-        except ImportError:
-            pass
+        except Exception as e:
+            print(f"  [麦克风错误] {e}")
 
     def _process_loop(self, frame_queue, audio_queue, cam_output):
         reconnect_interval = 100
         self._connect()
 
-        # 视频模式下,一次性发送全部音频 (除非用麦克风)
-        if self.video_path and not self.use_mic and not audio_queue.empty():
-            audio_data = audio_queue.get()
-            self._send_audio(audio_data)
+        # 视频模式下等音频提取完一次性发送
+        video_audio_sent = False
 
         while self.running:
             try:
                 frame = frame_queue.get(timeout=1)
             except queue.Empty:
+                # 等待音频期间也检查音频队列
+                if self.video_path and not self.use_mic and not video_audio_sent and not audio_queue.empty():
+                    audio_data = audio_queue.get()
+                    self._send_audio(audio_data)
+                    video_audio_sent = True
+                    print(f"\r  视频音频已发送: {len(audio_data)}样点  ", end="")
                 if self.video_path and frame_queue.qsize() == 0 and not self.loop:
                     print("\n视频播放完毕")
                     self.running = False
@@ -176,6 +247,13 @@ class TCPStreamingClient:
                 continue
 
             t0 = time.perf_counter()
+
+            # 视频模式下一次性发送音频
+            if self.video_path and not self.use_mic and not video_audio_sent and not audio_queue.empty():
+                audio_data = audio_queue.get()
+                self._send_audio(audio_data)
+                video_audio_sent = True
+                print(f"\r  视频音频已发送: {len(audio_data)}样点  ", end="")
 
             # 麦克风模式下持续发送音频
             if self.use_mic or not self.video_path:
@@ -186,7 +264,12 @@ class TCPStreamingClient:
                     except queue.Empty:
                         break
                 if audio_parts:
-                    self._send_audio(np.concatenate(audio_parts))
+                    combined = np.concatenate(audio_parts)
+                    if self.frame_count % 15 == 0:
+                        print(f"\r  发送音频: {len(combined)}样点, std={combined.std():.4f} sock={'OK' if self.sock else 'NO'}  ", end="")
+                    self._send_audio(combined)
+                elif self.frame_count % 90 == 0:
+                    print(f"\r  音频队列空, mic={'OK' if self.use_mic else 'OFF'}  ", end="")
 
             # 发送帧
             if self.sock is not None:
@@ -208,8 +291,16 @@ class TCPStreamingClient:
                 print(f"\rFPS: {1000/avg:.1f} | 延迟: {avg:.0f}ms | #{self.frame_count}", end="")
 
             if cam_output is not None:
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                cam_output.send(rgb)
+                try:
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    cam_output.send(rgb)
+                except Exception as e:
+                    print(f"\r[虚拟摄像头错误] {e}", end="")
+                    cam_output = None
+            elif self.obs_win:
+                cv2.imshow(self._obs_win_name, frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    self.running = False
             else:
                 cv2.imshow("HeyGem Live (TCP)", frame)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
