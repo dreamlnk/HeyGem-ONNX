@@ -99,12 +99,12 @@ def inverse_affine_transform(img_256, original_frame, M):
     soft_mask = _face_ellipse_mask()
     warped_alpha = cv2.warpAffine(soft_mask, M_roi, (roi_w, roi_h),
                                    flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_TRANSPARENT)
-    warped_alpha = warped_alpha[..., np.newaxis]  # [H, W] → [H, W, 1]
+    warped_alpha = np.clip(warped_alpha[..., np.newaxis], 0, 1)  # [H, W] → [H, W, 1]
 
     # Alpha混合: rendered_face * alpha + original * (1 - alpha)
     result = original_frame.copy()
     roi = result[y_min:y_max, x_min:x_max].astype(np.float32)
-    warped_face_f = warped_face.astype(np.float32)
+    warped_face_f = np.nan_to_num(warped_face.astype(np.float32))
 
     blended = warped_face_f * warped_alpha + roi * (1.0 - warped_alpha)
     result[y_min:y_max, x_min:x_max] = np.clip(blended, 0, 255).astype(np.uint8)
