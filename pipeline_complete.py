@@ -54,15 +54,25 @@ def align_face(img_bgr, kps, target_size=256, ref_pts=REFERENCE_POINTS):
     return aligned, M
 
 
-def inverse_affine_transform(img_256, original_frame, M, mouth_mask=None):
-    """将DINet输出(256x256)逆变换贴回原始帧"""
-    h, w = original_frame.shape[:2]
+def _face_ellipse_mask(size=256):
+    """创建椭圆形软遮罩, 用于合成时平滑过渡
+    基于REFERENCE_POINTS: 眼睛y≈118, 嘴巴y≈211, 鼻子y≈164
+    """
+    y, x = np.ogrid[:size, :size]
+    # 椭圆中心略偏上 (人脸在256x256中的位置)
+    cx, cy = size / 2, 135
+    # 半轴: 覆盖眼到嘴, 左右留边
+    rx, ry = 85, 110
+    ellipse = ((x - cx)**2 / rx**2 + (y - cy)**2 / ry**2) <= 1.0
+    mask = ellipse.astype(np.float32)
+    # 高斯模糊羽化边缘 (sigma=8 → ~24px过渡带)
+    mask = cv2.GaussianBlur(mask, (25, 25), 8)
+    return mask  # [0, 1] float32
 
-    # 遮罩白色背景: 面部内容通常在中间, 四角为白色背景
-    gray = cv2.cvtColor(img_256, cv2.COLOR_BGR2GRAY)
-    bg_mask = gray < 240
-    masked_256 = img_256.copy()
-    masked_256[~bg_mask] = 0
+
+def inverse_affine_transform(img_256, original_frame, M):
+    """将DINet输出(256x256)逆变换贴回原始帧 — 椭圆软遮罩平滑合成"""
+    h, w = original_frame.shape[:2]
 
     M_inv = cv2.invertAffineTransform(M)
     corners_256 = np.array([[0, 0], [255, 0], [255, 255], [0, 255]], dtype=np.float32)
@@ -81,21 +91,23 @@ def inverse_affine_transform(img_256, original_frame, M, mouth_mask=None):
     M_roi[0, 2] -= x_min
     M_roi[1, 2] -= y_min
 
-    warped_roi = cv2.warpAffine(masked_256, M_roi, (roi_w, roi_h),
-                                flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_TRANSPARENT)
+    # Warp渲染人脸
+    warped_face = cv2.warpAffine(img_256, M_roi, (roi_w, roi_h),
+                                  flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 
-    # 同时warp遮罩以排除边缘伪影
-    warped_mask = cv2.warpAffine(bg_mask.astype(np.uint8) * 255, M_roi, (roi_w, roi_h),
-                                 flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_TRANSPARENT)
+    # Warp椭圆软遮罩 (alpha通道)
+    soft_mask = _face_ellipse_mask()
+    warped_alpha = cv2.warpAffine(soft_mask, M_roi, (roi_w, roi_h),
+                                   flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_TRANSPARENT)
+    warped_alpha = warped_alpha[..., np.newaxis]  # [H, W] → [H, W, 1]
 
+    # Alpha混合: rendered_face * alpha + original * (1 - alpha)
     result = original_frame.copy()
-    roi = result[y_min:y_max, x_min:x_max]
+    roi = result[y_min:y_max, x_min:x_max].astype(np.float32)
+    warped_face_f = warped_face.astype(np.float32)
 
-    valid = warped_mask > 128
-    for c in range(3):
-        roi_c = roi[:, :, c]
-        roi_c[valid] = warped_roi[:, :, c][valid]
-    result[y_min:y_max, x_min:x_max] = roi
+    blended = warped_face_f * warped_alpha + roi * (1.0 - warped_alpha)
+    result[y_min:y_max, x_min:x_max] = np.clip(blended, 0, 255).astype(np.uint8)
 
     return result
 
@@ -333,6 +345,21 @@ class StreamingPipeline:
                 ref_tensor,
                 self.latest_audio_feat,
             )
+
+        # DEBUG: 跟踪渲染输出变化 + 定期保存快照
+        if self._last_rendered is not None:
+            diff = np.abs(rendered_256.astype(np.float32) - self._last_rendered.astype(np.float32)).mean()
+            if self.frame_idx % 30 == 0:
+                print(f"\r[DINet] 帧间差异={diff:.2f} (avg像素变化)  ", end="", flush=True,
+                      file=__import__('sys').stderr)
+        self._last_rendered = rendered_256.copy()
+        if self.frame_idx % 300 == 1:
+            cv2.imwrite("/tmp/dinet_rendered_256.png", rendered_256)
+            cv2.imwrite("/tmp/dinet_aligned_ref.png", aligned_face)
+            if self.frame_idx == 1:
+                cv2.imwrite("/tmp/dinet_aligned_src.png",
+                            ((self.source_face_tensor.cpu().numpy() * 0.5 + 0.5) * 255)
+                            .transpose(1, 2, 0).astype(np.uint8))
 
         # 6. 合成回原始帧
         result = inverse_affine_transform(rendered_256, frame_bgr, self.last_M)
