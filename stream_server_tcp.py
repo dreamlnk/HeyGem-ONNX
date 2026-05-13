@@ -6,7 +6,7 @@ import numpy as np
 import cv2
 
 sys.path.insert(0, os.path.dirname(__file__))
-from pipeline_complete import StreamingPipeline
+from pipeline_wav2lip import StreamingPipeline
 
 PORT = 7862
 

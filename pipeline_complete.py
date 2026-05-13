@@ -56,23 +56,8 @@ def align_face(img_bgr, kps, target_size=256, ref_pts=REFERENCE_POINTS):
     return aligned, M
 
 
-def _face_ellipse_mask(size=256):
-    """创建椭圆形软遮罩, 用于合成时平滑过渡
-    基于REFERENCE_POINTS: 眼睛y≈118, 嘴巴y≈211, 鼻子y≈164
-    """
-    y, x = np.ogrid[:size, :size]
-    # 椭圆中心匹配dlib对齐 (眼睛y≈90, 嘴巴y≈186)
-    cx, cy = size / 2, 130
-    rx, ry = 90, 115
-    ellipse = ((x - cx)**2 / rx**2 + (y - cy)**2 / ry**2) <= 1.0
-    mask = ellipse.astype(np.float32)
-    # 高斯模糊羽化边缘 (sigma=8 → ~24px过渡带)
-    mask = cv2.GaussianBlur(mask, (25, 25), 8)
-    return mask  # [0, 1] float32
-
-
 def inverse_affine_transform(img_256, original_frame, M):
-    """将DINet输出(256x256)逆变换贴回原始帧 — 椭圆软遮罩平滑合成"""
+    """将DINet输出(256x256)逆变换贴回原始帧 — 全脸合成 + 内容感知遮罩"""
     h, w = original_frame.shape[:2]
 
     M_inv = cv2.invertAffineTransform(M)
@@ -96,18 +81,26 @@ def inverse_affine_transform(img_256, original_frame, M):
     warped_face = cv2.warpAffine(img_256, M_roi, (roi_w, roi_h),
                                   flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 
-    # Warp椭圆软遮罩 (alpha通道)
-    soft_mask = _face_ellipse_mask()
-    warped_alpha = cv2.warpAffine(soft_mask, M_roi, (roi_w, roi_h),
-                                   flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_TRANSPARENT)
-    warped_alpha = np.clip(warped_alpha[..., np.newaxis], 0, 1)  # [H, W] → [H, W, 1]
+    # 内容感知遮罩: 模型输出白色区域(>200)不参与合成, 仅保留有内容的区域
+    gray_256 = cv2.cvtColor(img_256, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    # 使用更宽松的阈值(200而非235)，让更多模型输出参与合成
+    content_mask = 1.0 - np.clip(gray_256 / 255.0, 0, 1)
+    content_mask = np.clip(content_mask * 3.0, 0, 1)  # 增强非白色区域
+    content_mask = cv2.GaussianBlur(content_mask, (31, 31), 10)
+    warped_content = cv2.warpAffine(content_mask, M_roi, (roi_w, roi_h),
+                                     flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_TRANSPARENT)
+    warped_content = np.nan_to_num(warped_content, nan=0.0).clip(0, 1)
 
-    # Alpha混合: rendered_face * alpha + original * (1 - alpha)
+    # Alpha混合: 直接使用内容遮罩作为alpha
+    final_alpha = warped_content[..., np.newaxis]
+    final_alpha = np.clip(final_alpha, 0, 1)
+
     result = original_frame.copy()
     roi = result[y_min:y_max, x_min:x_max].astype(np.float32)
-    warped_face_f = np.nan_to_num(warped_face.astype(np.float32))
+    warped_face_f = np.nan_to_num(warped_face.astype(np.float32), nan=0.0, posinf=255.0, neginf=0.0)
 
-    blended = warped_face_f * warped_alpha + roi * (1.0 - warped_alpha)
+    blended = warped_face_f * final_alpha + roi * (1.0 - final_alpha)
+    blended = np.nan_to_num(blended, nan=0.0, posinf=255.0, neginf=0.0)
     result[y_min:y_max, x_min:x_max] = np.clip(blended, 0, 255).astype(np.uint8)
 
     return result
@@ -333,6 +326,10 @@ class StreamingPipeline:
         if self.source_face_tensor is None:
             self.set_source_face(frame_bgr, self.last_bbox, self.last_kps)
 
+        # 3.5. test_audio模式: 每帧更新交替测试特征
+        if self.test_audio:
+            self.feed_test_audio()
+
         # 4. 准备DINet输入
         if self.source_face_tensor is None or self.latest_audio_feat is None:
             return frame_bgr
@@ -350,11 +347,11 @@ class StreamingPipeline:
         # DEBUG: 跟踪渲染输出变化 + 定期保存快照
         if self._last_rendered is not None:
             diff = np.abs(rendered_256.astype(np.float32) - self._last_rendered.astype(np.float32)).mean()
-            if self.frame_idx % 30 == 0:
-                print(f"\r[DINet] 帧间差异={diff:.2f} (avg像素变化)  ", end="", flush=True,
+            if self.frame_idx % 15 == 0:
+                print(f"\r[DINet] 帧{self.frame_idx} 帧间差异={diff:.2f}  ", end="", flush=True,
                       file=__import__('sys').stderr)
         self._last_rendered = rendered_256.copy()
-        if self.frame_idx % 300 == 1:
+        if self.frame_idx % 15 == 1:
             cv2.imwrite("/tmp/dinet_rendered_256.png", rendered_256)
             cv2.imwrite("/tmp/dinet_aligned_ref.png", aligned_face)
             if self.frame_idx == 1:
@@ -364,6 +361,14 @@ class StreamingPipeline:
 
         # 6. 合成回原始帧
         result = inverse_affine_transform(rendered_256, frame_bgr, self.last_M)
+
+        # DEBUG: 每75帧保存合成结果
+        if self.frame_idx % 75 == 1:
+            cv2.imwrite("/tmp/dinet_composited.png", result)
+            # Save alpha visualization
+            gray_r = cv2.cvtColor(rendered_256, cv2.COLOR_BGR2GRAY)
+            content_viz = (np.clip(gray_r, 0, 255)).astype(np.uint8)
+            cv2.imwrite("/tmp/dinet_content.png", content_viz)
 
         return result
 
@@ -425,6 +430,8 @@ class StreamingPipeline:
 
     def feed_audio(self, audio_chunk, sample_rate=16000):
         """喂入音频 → 对数梅尔谱 → DINet [256,256]"""
+        if self.test_audio:
+            return  # test_audio模式下忽略客户端音频
         with self.audio_lock:
             self.audio_buffer = np.concatenate([self.audio_buffer, audio_chunk])
             max_samples = sample_rate * 10  # 保留最近10秒
@@ -442,17 +449,31 @@ class StreamingPipeline:
                           flush=True, file=__import__('sys').stderr)
 
     def feed_test_audio(self):
-        """极端测试: 交替两种完全不同的音频特征，验证DINet嘴型变化"""
-        import math
-        t = self.frame_idx
-        # 每30帧切换一次特征模式 (模拟开/闭嘴)
-        if (t // 30) % 2 == 0:
-            # "张嘴"特征: 全1
-            feat = np.ones((256, 256), dtype=np.float32)
-        else:
-            # "闭嘴"特征: 全0
-            feat = np.zeros((256, 256), dtype=np.float32)
-        self.latest_audio_feat = feat
+        """测试模式: 预计算交替音频特征，每15帧切换(张嘴/闭嘴)"""
+        if not hasattr(self, '_test_feats'):
+            import math
+            from phase2_audio_feature import prepare_logmel_dinet_input
+
+            sr = 16000
+            dur = 3.0
+            samples = int(sr * dur)
+            tt = np.linspace(0, dur, samples, endpoint=False, dtype=np.float32)
+
+            # 特征A: 高能量扫频 (模拟说话)
+            freq = 100.0 + 700.0 * (tt / dur)
+            sweep_a = np.sin(2.0 * math.pi * freq * tt).astype(np.float32) * 0.8
+
+            # 特征B: 静音
+            sweep_b = np.zeros(samples, dtype=np.float32)
+
+            self._test_feats = [
+                prepare_logmel_dinet_input(sweep_a),
+                prepare_logmel_dinet_input(sweep_b),
+            ]
+            print(f"  测试音频特征预计算完成", flush=True, file=__import__('sys').stderr)
+
+        idx = (self.frame_idx // 15) % 2
+        self.latest_audio_feat = self._test_feats[idx]
 
     def start(self):
         self.running = True
