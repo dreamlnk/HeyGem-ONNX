@@ -5,6 +5,7 @@ Windows 客户端 (TCP版) - 原始BGR传输, 零编解码开销
   python windows_client_tcp.py --virtualcam          # 摄像头+OBS虚拟摄像头
   python windows_client_tcp.py --video example/video.mp4           # 视频文件预览
   python windows_client_tcp.py --video example/video.mp4 --virtualcam  # 视频+OBS
+  python windows_client_tcp.py --video example/video.mp4 --audio audio.mp3  # 视频+独立音频
 """
 import time, queue, struct, socket, threading, argparse, os
 import numpy as np
@@ -22,9 +23,10 @@ AUDIO_CHUNK_SECONDS = 0.5
 
 class TCPStreamingClient:
     def __init__(self, video_path=None, use_virtualcam=False, loop=False,
-                 use_mic=False, portrait=False, obs_win=False):
+                 use_mic=False, portrait=False, obs_win=False, audio_path=None):
         self.running = False
         self.video_path = video_path
+        self.audio_path = audio_path
         self.loop = loop
         self.use_virtualcam = use_virtualcam
         self.use_mic = use_mic
@@ -183,6 +185,39 @@ class TCPStreamingClient:
         except Exception as e:
             print(f"  音频提取失败: {e}")
 
+    def _load_external_audio(self, audio_queue):
+        """加载外部音频文件 (mp3/wav), 重采样到16kHz, 分块流式发送"""
+        try:
+            import tempfile, subprocess, os as _os
+            if not _os.path.exists(self.audio_path):
+                print(f"  [错误] 音频文件不存在: {self.audio_path}")
+                return
+            audio_wav = _os.path.join(tempfile.gettempdir(), "_heygem_ext_audio.wav")
+            subprocess.run(
+                f'ffmpeg -y -i "{self.audio_path}" -ac 1 -ar {AUDIO_SAMPLE_RATE} '
+                f'"{audio_wav}"',
+                shell=True, capture_output=True, timeout=30,
+            )
+            if not _os.path.exists(audio_wav) or _os.path.getsize(audio_wav) == 0:
+                print("  音频转换失败")
+                return
+            import librosa
+            audio, sr = librosa.load(audio_wav, sr=AUDIO_SAMPLE_RATE, mono=True)
+            self._external_audio = audio.astype(np.float32)
+            self._audio_pos = 0
+            self._audio_start_time = None
+            print(f"  外部音频已加载: {len(self._external_audio)/sr:.0f}s (流式发送)")
+            # 本地播放
+            try:
+                import sounddevice as sd
+                sd.play(self._external_audio, samplerate=AUDIO_SAMPLE_RATE)
+                print(f"  音频播放中...")
+            except Exception:
+                print("  [提示] sounddevice未安装，无法本地播放音频")
+            _os.remove(audio_wav)
+        except Exception as e:
+            print(f"  外部音频加载失败: {e}")
+
     def _capture_mic(self, audio_queue):
         """麦克风采集"""
         try:
@@ -243,12 +278,12 @@ class TCPStreamingClient:
                 frame = frame_queue.get(timeout=1)
             except queue.Empty:
                 # 等待音频期间也检查音频队列
-                if self.video_path and not self.use_mic and not video_audio_sent and not audio_queue.empty():
+                if (self.video_path or self.audio_path) and not self.use_mic and not video_audio_sent and not audio_queue.empty():
                     audio_data = audio_queue.get()
                     self._send_audio(audio_data)
                     video_audio_sent = True
                     print(f"\r  视频音频已发送: {len(audio_data)}样点  ", end="")
-                if self.video_path and frame_queue.qsize() == 0 and not self.loop:
+                if (self.video_path or self.audio_path) and frame_queue.qsize() == 0 and not self.loop:
                     print("\n视频播放完毕")
                     self.running = False
                     break
@@ -256,8 +291,22 @@ class TCPStreamingClient:
 
             t0 = time.perf_counter()
 
-            # 视频模式下一次性发送音频
-            if self.video_path and not self.use_mic and not video_audio_sent and not audio_queue.empty():
+            # 外部音频: 按时间流式发送
+            if self.audio_path and hasattr(self, '_external_audio') and self._external_audio is not None:
+                if self._audio_start_time is None:
+                    self._audio_start_time = time.perf_counter()
+                elapsed = time.perf_counter() - self._audio_start_time
+                target_pos = int(elapsed * AUDIO_SAMPLE_RATE)
+                if target_pos > self._audio_pos and self._audio_pos < len(self._external_audio):
+                    chunk_end = min(target_pos, len(self._external_audio))
+                    chunk = self._external_audio[self._audio_pos:chunk_end]
+                    if len(chunk) > 0:
+                        self._send_audio(chunk)
+                        if self.frame_count % 30 == 0:
+                            print(f"\r  音频流: {self._audio_pos/AUDIO_SAMPLE_RATE:.1f}s/{len(self._external_audio)/AUDIO_SAMPLE_RATE:.0f}s  ", end="")
+                    self._audio_pos = chunk_end
+            # 视频自带音频: 一次性发送
+            elif self.video_path and not self.use_mic and not video_audio_sent and not audio_queue.empty():
                 audio_data = audio_queue.get()
                 self._send_audio(audio_data)
                 video_audio_sent = True
@@ -363,14 +412,11 @@ class TCPStreamingClient:
 
         # 音频
         if self.use_mic:
-            # 麦克风驱动嘴型 (可与视频/摄像头组合)
-            audio_ok = False
-            try:
-                import sounddevice
-                print(f"麦克风: {AUDIO_SAMPLE_RATE}Hz (嘴型驱动)")
-                audio_ok = True
-            except ImportError:
-                print("麦克风: 不可用 (pip install sounddevice)")
+            audio_ok = True
+            print(f"麦克风: {AUDIO_SAMPLE_RATE}Hz (嘴型驱动)")
+        elif self.audio_path:
+            audio_ok = True
+            print(f"外部音频: {os.path.basename(self.audio_path)}")
         elif self.video_path:
             audio_ok = True  # 从视频提取
         else:
@@ -394,6 +440,9 @@ class TCPStreamingClient:
 
         if self.use_mic:
             threading.Thread(target=self._capture_mic,
+                             args=(audio_queue,), daemon=True).start()
+        elif self.audio_path:
+            threading.Thread(target=self._load_external_audio,
                              args=(audio_queue,), daemon=True).start()
         elif self.video_path:
             threading.Thread(target=self._capture_audio_from_video,
@@ -427,6 +476,7 @@ if __name__ == "__main__":
     parser.add_argument("--mic", action="store_true", help="麦克风驱动嘴型(可与视频组合)")
     parser.add_argument("--portrait", action="store_true", help="竖屏输出 720x1280")
     parser.add_argument("--camera", type=int, default=0, help="摄像头ID")
+    parser.add_argument("--audio", type=str, default=None, help="独立音频文件路径")
     args = parser.parse_args()
     if args.video:
         CAMERA_ID = None
@@ -434,4 +484,4 @@ if __name__ == "__main__":
         CAMERA_ID = args.camera
     TCPStreamingClient(video_path=args.video, use_virtualcam=args.virtualcam,
                        loop=args.loop, use_mic=args.mic,
-                       portrait=args.portrait).start()
+                       portrait=args.portrait, audio_path=args.audio).start()
