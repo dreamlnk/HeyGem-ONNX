@@ -68,9 +68,10 @@ class StreamingPipeline:
         self.audio_lock = threading.Lock()
         self.latest_mel = None
 
-        # Face tracking
+        # Face tracking with temporal smoothing
         self.last_bbox = None
         self.last_kps = None
+        self._bbox_history = []  # rolling buffer of (x1,y1,x2,y2) for smoothing
 
         # Previous face for Wav2Lip 2-frame stacking (RGB, [-1,1], (3,96,96))
         self.prev_face_norm = None
@@ -123,7 +124,9 @@ class StreamingPipeline:
 
     def _get_mel_input(self):
         if self.test_audio:
-            return self._get_test_mel()
+            self.feed_test_audio()
+            idx = (self.frame_idx // 15) % 2
+            return self._test_mels[idx]
         with self.audio_lock:
             if len(self.audio_buffer) < 3200:  # < 200ms
                 return np.zeros((1, 1, 80, 16), dtype=np.float32)
@@ -208,6 +211,7 @@ class StreamingPipeline:
             if not valid_found:
                 self.last_bbox = None
                 self.last_kps = None
+                self._bbox_history.clear()
                 self.prev_face_norm = None
 
         if self.last_bbox is None:
@@ -216,11 +220,17 @@ class StreamingPipeline:
         if not self._valid_detection(self.last_bbox, self.last_kps, frame_bgr):
             self.last_bbox = None
             self.last_kps = None
+            self._bbox_history.clear()
             self.prev_face_norm = None
             return frame_bgr
 
-        # --- 2. Crop face region from bbox ---
-        x1, y1, x2, y2 = self.last_bbox.astype(int)
+        # --- 2. Crop face region from temporally-smoothed bbox ---
+        raw_bbox = self.last_bbox.astype(float)
+        self._bbox_history.append(raw_bbox.copy())
+        if len(self._bbox_history) > 5:
+            self._bbox_history.pop(0)
+        smooth_bbox = np.mean(self._bbox_history, axis=0)
+        x1, y1, x2, y2 = smooth_bbox.astype(int)
         bw, bh = x2 - x1, y2 - y1
 
         # Wav2Lip-style asymmetric padding: no left/right, slight top, larger bottom for chin
@@ -246,8 +256,6 @@ class StreamingPipeline:
         self.prev_face_norm = current_norm
 
         # --- 4. Get mel input ---
-        if self.test_audio:
-            self.feed_test_audio()
         mel_input = torch.from_numpy(self._get_mel_input())
 
         # --- 5. Wav2Lip inference ---
