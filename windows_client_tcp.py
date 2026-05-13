@@ -168,9 +168,17 @@ class TCPStreamingClient:
                 return
             import librosa
             audio, sr = librosa.load(audio_path, sr=AUDIO_SAMPLE_RATE, mono=True)
+            audio_f32 = audio.astype(np.float32)
             # 一次性发送全部音频
-            audio_queue.put(audio.astype(np.float32))
+            audio_queue.put(audio_f32)
             print(f"  视频音频已提取: {len(audio)/sr:.0f}s")
+            # 本地播放音频
+            try:
+                import sounddevice as sd
+                sd.play(audio_f32, samplerate=AUDIO_SAMPLE_RATE)
+                print(f"  音频播放中...")
+            except Exception:
+                print("  [提示] sounddevice未安装，无法本地播放音频")
             _os.remove(audio_path)
         except Exception as e:
             print(f"  音频提取失败: {e}")
