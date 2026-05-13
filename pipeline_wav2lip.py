@@ -73,7 +73,7 @@ class StreamingPipeline:
         self.last_kps = None
         self._bbox_history = []  # rolling buffer of (x1,y1,x2,y2) for smoothing
 
-        # Previous face for Wav2Lip 2-frame stacking (RGB, [-1,1], (3,96,96))
+        # Previous face for Wav2Lip 2-frame stacking (RGB, [0,1], (3,96,96))
         self.prev_face_norm = None
 
         # CUDA inference lock
@@ -262,13 +262,21 @@ class StreamingPipeline:
         with self.wav2lip_lock:
             rendered_96 = self.wav2lip.infer(face_stack.unsqueeze(0), mel_input)
 
-        # --- 6. Composite back into original frame ---
+        # --- 6. Composite: only replace lower face (mouth region) ---
         rendered_resized = cv2.resize(rendered_96, (crop_w, crop_h),
                                       interpolation=cv2.INTER_LINEAR)
 
-        # Feather mask for smooth blending
-        mask = _create_feather_mask(crop_h, crop_w)
-        mask_3 = mask[..., np.newaxis]  # (h, w, 1)
+        # Mask: keep upper face original, replace lower face with rendered
+        # Split line at ~45% from top (above mouth), feather over 10% band
+        split = int(crop_h * 0.45)
+        band = max(1, int(crop_h * 0.10))
+        mask = np.zeros((crop_h, crop_w), dtype=np.float32)
+        mask[split + band:, :] = 1.0
+        transition = slice(split, split + band)
+        for r in range(band):
+            mask[split + r, :] = (r + 1) / band
+        mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=band / 2.0)
+        mask_3 = mask[..., np.newaxis]
 
         roi = frame_bgr[cy1:cy2, cx1:cx2].astype(np.float32)
         rendered_f = rendered_resized.astype(np.float32)

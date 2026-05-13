@@ -39,7 +39,7 @@ class Wav2LipInferenceEngine:
         """Run Wav2Lip inference for a single frame.
 
         Args:
-            face_stack: (1, 6, 96, 96) float32 on CPU, 2-frame RGB stack in [-1, 1]
+            face_stack: (1, 6, 96, 96) float32 on CPU, 2-frame RGB stack in [0, 1]
             mel:        (1, 1, 80, 16) float32 on CPU, log-mel
         Returns:
             rendered: (96, 96, 3) uint8 BGR image
@@ -61,13 +61,13 @@ def preprocess_face_wav2lip(face_bgr_96, prev_face_rgb_norm=None):
 
     Args:
         face_bgr_96: (96, 96, 3) uint8 BGR face crop
-        prev_face_rgb_norm: (3, 96, 96) float32 [-1,1] from previous frame, or None
+        prev_face_rgb_norm: (3, 96, 96) float32 [0,1] from previous frame, or None
     Returns:
         face_stack: (6, 96, 96) float32 tensor
         current_rgb_norm: (3, 96, 96) float32, to pass as prev_face next frame
     """
     face_rgb = cv2.cvtColor(face_bgr_96, cv2.COLOR_BGR2RGB)
-    face_norm = (face_rgb.astype(np.float32) / 127.5) - 1.0  # -> [-1, 1]
+    face_norm = face_rgb.astype(np.float32) / 255.0  # -> [0, 1]
     current = torch.from_numpy(face_norm).permute(2, 0, 1)     # (3, 96, 96)
 
     if prev_face_rgb_norm is None:
