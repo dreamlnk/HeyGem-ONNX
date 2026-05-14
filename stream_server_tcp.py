@@ -6,9 +6,14 @@ import numpy as np
 import cv2
 
 sys.path.insert(0, os.path.dirname(__file__))
+
 from pipeline_wav2lip import StreamingPipeline
 
 PORT = 7863
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_CONN = os.path.join(BASE_DIR, "debug_conn.log")
+LOG_MAIN = os.path.join(BASE_DIR, "debug_main.log")
 
 
 def recv_exact(sock, n):
@@ -24,7 +29,7 @@ def recv_exact(sock, n):
 
 def handle_client(conn, addr, pipeline):
     """Handle a single client connection."""
-    with open("D:/HeyGem ONNX/HeyGem-Linux-Python-Hack-RTX-50/debug_conn.log", "a") as f:
+    with open(LOG_CONN, "a") as f:
         f.write(f"CONNECTED {addr}\n")
     pipeline.last_bbox = None
     pipeline.last_kps = None
@@ -43,7 +48,7 @@ def handle_client(conn, addr, pipeline):
                 audio_np = np.frombuffer(payload, dtype=np.float32).copy()
                 if len(audio_np) > 0:
                     pipeline.feed_audio(audio_np)
-                    with open("D:/HeyGem ONNX/HeyGem-Linux-Python-Hack-RTX-50/debug_conn.log", "a") as f:
+                    with open(LOG_CONN, "a") as f:
                         f.write(f"AUDIO {len(audio_np)} max={audio_np.max():.3f}\n")
                 continue
 
@@ -68,7 +73,7 @@ def handle_client(conn, addr, pipeline):
                     continue
 
                 frame = np.frombuffer(frame_data, dtype=np.uint8).reshape(h, w, 3).copy()
-                with open("D:/HeyGem ONNX/HeyGem-Linux-Python-Hack-RTX-50/debug_conn.log", "a") as f:
+                with open(LOG_CONN, "a") as f:
                     f.write(f"FRAME {pipeline.frame_idx} {w}x{h}\n")
                 rendered_96, coords = pipeline.process_frame(frame)
                 if rendered_96 is not None:
@@ -98,7 +103,7 @@ def main():
     parser.add_argument("--size", type=int, default=96, choices=[96, 256], help="模型分辨率 (默认96)")
     args = parser.parse_args()
 
-    with open("D:/HeyGem ONNX/HeyGem-Linux-Python-Hack-RTX-50/debug_main.log", "w") as f:
+    with open(LOG_MAIN, "w") as f:
         f.write(f"Server starting, PID: {os.getpid()}\n")
         f.write(f"CWD: {os.getcwd()}\n")
         f.write(f"Script: {__file__}\n")
@@ -122,10 +127,10 @@ def main():
 
     try:
         while True:
-            with open("D:/HeyGem ONNX/HeyGem-Linux-Python-Hack-RTX-50/debug_conn.log", "a") as f:
+            with open(LOG_CONN, "a") as f:
                 f.write("Waiting for accept...\n")
             conn, addr = sock.accept()
-            with open("D:/HeyGem ONNX/HeyGem-Linux-Python-Hack-RTX-50/debug_conn.log", "a") as f:
+            with open(LOG_CONN, "a") as f:
                 f.write(f"ACCEPT {addr}\n")
             t = threading.Thread(target=handle_client, args=(conn, addr, pipeline),
                                  daemon=True)
