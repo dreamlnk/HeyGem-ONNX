@@ -12,7 +12,7 @@ import numpy as np
 import cv2
 
 # === 配置 ===
-WSL_HOST = "192.168.1.19"
+WSL_HOST = "127.0.0.1"
 WSL_PORT = 7863
 WIDTH, HEIGHT = 1280, 720
 FRAME_SIZE = WIDTH * HEIGHT * 3
