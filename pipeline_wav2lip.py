@@ -73,8 +73,7 @@ class StreamingPipeline:
         self.last_kps = None
         self._bbox_history = []  # rolling buffer of (x1,y1,x2,y2) for smoothing
 
-        # Previous face for Wav2Lip 2-frame stacking (RGB, [0,1], (3,96,96))
-        self.prev_face_norm = None
+        # (No prev_face needed — Wav2Lip uses [masked_lower, full_face] stacking, not temporal)
 
         # CUDA inference lock
         self.wav2lip_lock = threading.Lock()
@@ -88,7 +87,7 @@ class StreamingPipeline:
 
         print("  Warming up...")
         self._warmup()
-        print("  Ready ✓")
+        print("  Ready")
         print("=" * 60)
 
     # ------------------------------------------------------------------
@@ -128,10 +127,15 @@ class StreamingPipeline:
             idx = (self.frame_idx // 15) % 2
             return self._test_mels[idx]
         with self.audio_lock:
-            if len(self.audio_buffer) < 3200:  # < 200ms
+            buf_len = len(self.audio_buffer)
+            if buf_len < 3200:  # < 200ms
                 return np.zeros((1, 1, 80, 16), dtype=np.float32)
             mel = mel_spectrogram(self.audio_buffer)
-        return get_wav2lip_mel_input(mel)
+        mel_input = get_wav2lip_mel_input(mel)
+        if self.frame_idx <= 5 or self.frame_idx % 30 == 0:
+            with open("debug_pipeline.txt", "a") as df:
+                df.write(f"Audio F{self.frame_idx}: buf={buf_len} mel_range=[{mel.min():.2f},{mel.max():.2f}] mel_mean={mel_input.mean():.3f}\n")
+        return mel_input
 
     def feed_test_audio(self):
         if not hasattr(self, '_test_mels'):
@@ -195,6 +199,9 @@ class StreamingPipeline:
         """Process a single BGR frame through the Wav2Lip pipeline."""
         self.frame_idx += 1
         H, W = frame_bgr.shape[:2]
+        if self.frame_idx <= 3:
+            with open("debug_conn.log", "a") as f:
+                f.write(f"process_frame {self.frame_idx} {W}x{H}\n")
 
         # --- 1. Face detection (skip frames) ---
         do_detect = (self.frame_idx % self.detect_interval == 0) or (self.last_bbox is None)
@@ -209,51 +216,57 @@ class StreamingPipeline:
                     valid_found = True
                     break
             if not valid_found:
+                if self.frame_idx <= 5 or self.frame_idx % 100 == 0:
+                    with open("debug_pipeline.txt", "a") as df:
+                        df.write(f"F{self.frame_idx} DETECT FAIL n={len(bboxes)}\n")
                 self.last_bbox = None
                 self.last_kps = None
                 self._bbox_history.clear()
-                self.prev_face_norm = None
+                if hasattr(self, '_kps_history'):
+                    self._kps_history.clear()
 
         if self.last_bbox is None:
-            return frame_bgr
+            return None, None
 
         if not self._valid_detection(self.last_bbox, self.last_kps, frame_bgr):
             self.last_bbox = None
             self.last_kps = None
             self._bbox_history.clear()
-            self.prev_face_norm = None
-            return frame_bgr
+            if hasattr(self, '_kps_history'):
+                self._kps_history.clear()
+            return None, None
 
-        # --- 2. Crop face region from temporally-smoothed bbox ---
+        # --- 2. Crop face region (bbox center, square, symmetric padding) ---
         raw_bbox = self.last_bbox.astype(float)
         self._bbox_history.append(raw_bbox.copy())
         if len(self._bbox_history) > 5:
             self._bbox_history.pop(0)
         smooth_bbox = np.mean(self._bbox_history, axis=0)
-        x1, y1, x2, y2 = smooth_bbox.astype(int)
+        x1, y1, x2, y2 = smooth_bbox
         bw, bh = x2 - x1, y2 - y1
+        cx = x1 + bw / 2.0
+        cy = y1 + bh / 2.0 - bh * 0.05  # slight upward shift
+        size = max(bw, bh) * 1.1
+        half = size / 2.0
+        cx1 = int(cx - half)
+        cy1 = int(cy - half)
+        cx2 = int(cx + half)
+        cy2 = int(cy + half)
 
-        # Wav2Lip-style asymmetric padding: no left/right, slight top, larger bottom for chin
-        pad_top = int(bh * 0.05)
-        pad_bottom = int(bh * 0.15)
-        pad_left = int(bw * 0.05)
-        pad_right = int(bw * 0.05)
-
-        cx1 = max(0, x1 - pad_left)
-        cy1 = max(0, y1 - pad_top)
-        cx2 = min(W, x2 + pad_right)
-        cy2 = min(H, y2 + pad_bottom)
+        cx1 = max(0, cx1)
+        cy1 = max(0, cy1)
+        cx2 = min(W, cx2)
+        cy2 = min(H, cy2)
 
         if cx2 - cx1 < 10 or cy2 - cy1 < 10:
-            return frame_bgr
+            return None, None
 
         face_crop = frame_bgr[cy1:cy2, cx1:cx2].copy()
         crop_h, crop_w = face_crop.shape[:2]
 
         # --- 3. Preprocess for Wav2Lip ---
         face_96 = cv2.resize(face_crop, (96, 96), interpolation=cv2.INTER_AREA)
-        face_stack, current_norm = preprocess_face_wav2lip(face_96, self.prev_face_norm)
-        self.prev_face_norm = current_norm
+        face_stack = preprocess_face_wav2lip(face_96)
 
         # --- 4. Get mel input ---
         mel_input = torch.from_numpy(self._get_mel_input())
@@ -262,44 +275,33 @@ class StreamingPipeline:
         with self.wav2lip_lock:
             rendered_96 = self.wav2lip.infer(face_stack.unsqueeze(0), mel_input)
 
-        # --- 6. Composite: only replace lower face (mouth region) ---
-        rendered_resized = cv2.resize(rendered_96, (crop_w, crop_h),
-                                      interpolation=cv2.INTER_LINEAR)
+        # Return rendered 96x96 face + crop coords.
+        # Client computes delta = rendered - original_downscaled locally (no clipping).
+        if self.frame_idx == 1:
+            cv2.imwrite("debug_face_crop.png", face_crop)
+            cv2.imwrite("debug_rendered_f1.png", rendered_96)
+            with open("debug_pipeline.txt", "a") as df:
+                df.write(f"F1 crop={crop_w}x{crop_h} rect=({cx1},{cy1})-({cx2},{cy2})\n")
+        if self.frame_idx == 30:
+            cv2.imwrite("debug_rendered_f30.png", rendered_96)
+            with open("debug_pipeline.txt", "a") as df:
+                df.write(f"F30 crop={crop_w}x{crop_h} rect=({cx1},{cy1})-({cx2},{cy2})\n")
+                if os.path.exists("debug_rendered_f1.png"):
+                    f1 = cv2.imread("debug_rendered_f1.png")
+                    if f1 is not None:
+                        diff = np.abs(f1.astype(float) - rendered_96.astype(float))
+                        df.write(f"F1vsF30 diff: mean={diff.mean():.1f}/255 max={diff.max():.0f}/255 mouth_mean={diff[48:,:,:].mean():.1f}/255\n")
+        if self._last_rendered_96 is not None and self.frame_idx <= 5:
+            diff = np.abs(rendered_96.astype(float) -
+                          self._last_rendered_96.astype(float)).mean()
+            mouth = rendered_96[48:, :, :]
+            mouth_prev = self._last_rendered_96[48:, :, :]
+            mouth_diff = np.abs(mouth.astype(float) - mouth_prev.astype(float)).mean()
+            with open("debug_pipeline.txt", "a") as df:
+                df.write(f"F{self.frame_idx} df={diff:.1f} mouth_df={mouth_diff:.1f}\n")
+        self._last_rendered_96 = rendered_96.copy()
 
-        # Mask: keep upper face original, replace lower face with rendered
-        # Split line at ~45% from top (above mouth), feather over 10% band
-        split = int(crop_h * 0.45)
-        band = max(1, int(crop_h * 0.10))
-        mask = np.zeros((crop_h, crop_w), dtype=np.float32)
-        mask[split + band:, :] = 1.0
-        transition = slice(split, split + band)
-        for r in range(band):
-            mask[split + r, :] = (r + 1) / band
-        mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=band / 2.0)
-        mask_3 = mask[..., np.newaxis]
-
-        roi = frame_bgr[cy1:cy2, cx1:cx2].astype(np.float32)
-        rendered_f = rendered_resized.astype(np.float32)
-        blended = rendered_f * mask_3 + roi * (1.0 - mask_3)
-        frame_bgr[cy1:cy2, cx1:cx2] = np.clip(blended, 0, 255).astype(np.uint8)
-
-        # --- Debug output ---
-        if self.frame_idx % 15 == 1:
-            cv2.imwrite("/tmp/wav2lip_face_crop.png", face_crop)
-            cv2.imwrite("/tmp/wav2lip_rendered_96.png", rendered_96)
-            cv2.imwrite("/tmp/wav2lip_composited.png", frame_bgr)
-            if self._last_rendered_96 is not None:
-                diff = np.abs(rendered_96.astype(float) -
-                              self._last_rendered_96.astype(float)).mean()
-                mouth = rendered_96[48:, :, :]  # lower half
-                mouth_prev = self._last_rendered_96[48:, :, :]
-                mouth_diff = np.abs(mouth.astype(float) - mouth_prev.astype(float)).mean()
-                print(f"\r[Wav2Lip] frame={self.frame_idx} "
-                      f"face_diff={diff:.1f} mouth_diff={mouth_diff:.1f}",
-                      end="", flush=True, file=sys.stderr)
-            self._last_rendered_96 = rendered_96.copy()
-
-        return frame_bgr
+        return rendered_96, (cx1, cy1, cx2, cy2)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -310,6 +312,8 @@ class StreamingPipeline:
 
     def stop(self):
         self.running = False
-        self.prev_face_norm = None
         self.last_bbox = None
         self.last_kps = None
+        self._bbox_history.clear()
+        if hasattr(self, '_kps_history'):
+            self._kps_history.clear()

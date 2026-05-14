@@ -12,8 +12,8 @@ import numpy as np
 import cv2
 
 # === 配置 ===
-WSL_HOST = "192.168.82.30"
-WSL_PORT = 7862
+WSL_HOST = "192.168.1.19"
+WSL_PORT = 7863
 WIDTH, HEIGHT = 1280, 720
 FRAME_SIZE = WIDTH * HEIGHT * 3
 CAMERA_ID = 0
@@ -66,12 +66,45 @@ class TCPStreamingClient:
                 hdr = struct.pack("<BI", 0, len(data))
                 self.sock.sendall(hdr + data)
                 result_len = struct.unpack("<I", self._recv_exact(4))[0]
-                if result_len > 0:
-                    return np.frombuffer(self._recv_exact(result_len),
-                                         dtype=np.uint8).reshape(h, w, 3).copy()
+                if result_len == 0:
+                    return None
+                payload = self._recv_exact(result_len)
+                if result_len >= 27656:
+                    cx1, cy1, cx2, cy2 = struct.unpack("<hhhh", payload[:8])
+                    rendered_96 = np.frombuffer(payload[8:27656], dtype=np.uint8).reshape(96, 96, 3)
+                    return self._composite_face(frame_bgr, rendered_96, cx1, cy1, cx2, cy2)
+                return None
             except Exception:
                 self.sock = None
                 return None
+
+    def _composite_face(self, frame, rendered_96, cx1, cy1, cx2, cy2):
+        """Apply Wav2Lip mouth changes to original sharp face using delta blending.
+        Uses an elliptical mask with wide, smooth feathering to avoid visible edges."""
+        H, W = frame.shape[:2]
+        cx1, cx2 = max(0, cx1), min(W, cx2)
+        cy1, cy2 = max(0, cy1), min(H, cy2)
+        crop_h, crop_w = cy2 - cy1, cx2 - cx1
+        if crop_w < 5 or crop_h < 5:
+            return frame
+        orig_crop = frame[cy1:cy2, cx1:cx2].astype(np.float32)
+        # Compute delta at 96x96
+        orig_96 = cv2.resize(orig_crop, (96, 96), interpolation=cv2.INTER_AREA)
+        delta_96 = rendered_96.astype(np.float32) - orig_96
+        delta_up = cv2.resize(delta_96, (crop_w, crop_h), interpolation=cv2.INTER_CUBIC)
+        enhanced = orig_crop + delta_up
+        # Elliptical mask centered on mouth, with heavy Gaussian feather
+        cx, cy = crop_w / 2.0, crop_h * 0.72  # mouth center
+        rx, ry = crop_w * 0.38, crop_h * 0.25  # ellipse radii
+        yy, xx = np.ogrid[:crop_h, :crop_w]
+        dist = ((xx - cx) / rx) ** 2 + ((yy - cy) / ry) ** 2
+        mask = np.clip(1.0 - dist, 0, 1).astype(np.float32)
+        # Heavy feather to avoid visible edges
+        mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=min(crop_h, crop_w) * 0.08)
+        mask = np.clip(mask, 0, 1)
+        blended = enhanced * mask[..., None] + orig_crop * (1 - mask[..., None])
+        frame[cy1:cy2, cx1:cx2] = np.clip(blended, 0, 255).astype(np.uint8)
+        return frame
 
     def _send_audio(self, audio_np):
         with self.sock_lock:
@@ -81,6 +114,15 @@ class TCPStreamingClient:
                 data = audio_np.astype(np.float32).tobytes()
                 hdr = struct.pack("<BI", 1, len(data))
                 self.sock.sendall(hdr + data)
+            except Exception:
+                self.sock = None
+
+    def _send_reset(self):
+        with self.sock_lock:
+            if self.sock is None:
+                return
+            try:
+                self.sock.sendall(struct.pack("<BI", 2, 0))
             except Exception:
                 self.sock = None
 
@@ -206,14 +248,8 @@ class TCPStreamingClient:
             self._external_audio = audio.astype(np.float32)
             self._audio_pos = 0
             self._audio_start_time = None
-            print(f"  外部音频已加载: {len(self._external_audio)/sr:.0f}s (流式发送)")
-            # 本地播放
-            try:
-                import sounddevice as sd
-                sd.play(self._external_audio, samplerate=AUDIO_SAMPLE_RATE)
-                print(f"  音频播放中...")
-            except Exception:
-                print("  [提示] sounddevice未安装，无法本地播放音频")
+            self._audio_play_pending = True  # 等管线预热后再播放
+            print(f"  外部音频已加载: {len(self._external_audio)/sr:.0f}s (流式发送, 延迟播放)")
             _os.remove(audio_wav)
         except Exception as e:
             print(f"  外部音频加载失败: {e}")
@@ -291,19 +327,31 @@ class TCPStreamingClient:
 
             t0 = time.perf_counter()
 
-            # 外部音频: 按时间流式发送
+            # 外部音频: 视频帧号驱动, 与视频精确同步
             if self.audio_path and hasattr(self, '_external_audio') and self._external_audio is not None:
-                if self._audio_start_time is None:
-                    self._audio_start_time = time.perf_counter()
-                elapsed = time.perf_counter() - self._audio_start_time
-                target_pos = int(elapsed * AUDIO_SAMPLE_RATE)
+                # 音频播完且视频循环 → 重新开始
+                if self._audio_pos >= len(self._external_audio) and self.loop:
+                    self._audio_pos = 0
+                    self._send_reset()
+                    print("\r  音频循环...", end="")
+                # 用视频帧号计算目标音频位置 (帧率同步, 不依赖墙上时钟)
+                fps = getattr(self, '_video_fps', 25) or 25
+                target_pos = int(self.frame_count / fps * AUDIO_SAMPLE_RATE)
+                # 本地音频播放: 从当前视频位置开始(对齐画面)
+                if getattr(self, '_audio_play_pending', False) and self.frame_count >= 3:
+                    try:
+                        import sounddevice as sd
+                        fps = getattr(self, '_video_fps', 25) or 25
+                        start_sample = int(self.frame_count / fps * AUDIO_SAMPLE_RATE)
+                        sd.play(self._external_audio[start_sample:], samplerate=AUDIO_SAMPLE_RATE)
+                    except Exception:
+                        pass
+                    self._audio_play_pending = False
                 if target_pos > self._audio_pos and self._audio_pos < len(self._external_audio):
                     chunk_end = min(target_pos, len(self._external_audio))
                     chunk = self._external_audio[self._audio_pos:chunk_end]
                     if len(chunk) > 0:
                         self._send_audio(chunk)
-                        if self.frame_count % 30 == 0:
-                            print(f"\r  音频流: {self._audio_pos/AUDIO_SAMPLE_RATE:.1f}s/{len(self._external_audio)/AUDIO_SAMPLE_RATE:.0f}s  ", end="")
                     self._audio_pos = chunk_end
             # 视频自带音频: 一次性发送
             elif self.video_path and not self.use_mic and not video_audio_sent and not audio_queue.empty():
@@ -356,11 +404,11 @@ class TCPStreamingClient:
                     cam_output = None
             elif self.obs_win:
                 cv2.imshow(self._obs_win_name, frame)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
+                if cv2.waitKey(10) & 0xFF == ord("q"):
                     self.running = False
             else:
                 cv2.imshow("HeyGem Live (TCP)", frame)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
+                if cv2.waitKey(10) & 0xFF == ord("q"):
                     self.running = False
 
     def start(self):
@@ -394,6 +442,7 @@ class TCPStreamingClient:
             self.width, self.height = 720, 1280
         else:
             self.width, self.height = WIDTH, HEIGHT
+        self._video_fps = fps_video
         print(f"输出: {self.width}x{self.height}")
 
         # 虚拟摄像头
@@ -451,6 +500,15 @@ class TCPStreamingClient:
             threading.Thread(target=self._capture_mic,
                              args=(audio_queue,), daemon=True).start()
 
+        # 清理残留窗口 + 设置预览窗口 (可自由调整大小)
+        cv2.destroyAllWindows()
+        if self.obs_win:
+            self._setup_obs_window()
+        elif not self.use_virtualcam:
+            cv2.namedWindow("HeyGem Live (TCP)", cv2.WINDOW_NORMAL)
+            cv2.resizeWindow("HeyGem Live (TCP)", self.width, self.height)
+            cv2.moveWindow("HeyGem Live (TCP)", 0, 0)
+
         mode = "视频文件" if self.video_path else "摄像头"
         print(f"\n{mode}模式运行中... Ctrl+C 停止, Q 退出预览\n")
         try:
@@ -469,6 +527,13 @@ class TCPStreamingClient:
 
 
 if __name__ == "__main__":
+    # Single-instance check
+    import ctypes, sys as _sys
+    _mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "Global\\HeyGemTCPClient")
+    if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        print("HeyGem TCP 客户端已在运行中，请先关闭现有窗口")
+        _sys.exit(0)
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--video", type=str, default=None, help="视频文件路径")
     parser.add_argument("--virtualcam", action="store_true", help="OBS虚拟摄像头输出")

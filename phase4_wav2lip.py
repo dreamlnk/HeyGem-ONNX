@@ -10,15 +10,24 @@ from models_wav2lip.wav2lip import Wav2Lip
 class Wav2LipInferenceEngine:
     def __init__(self, model_path: str = None):
         if model_path is None:
-            model_path = os.path.join(
-                os.path.dirname(__file__), "pretrain_models", "wav2lip_gan.pth"
-            )
+            base = os.path.join(os.path.dirname(__file__), "pretrain_models")
+            # Prefer non-GAN checkpoint if available
+            candidates = [
+                os.path.join(base, "wav2lip_gan.pth"),
+                os.path.join(base, "wav2lip.pth"),
+            ]
+            model_path = next((p for p in candidates if os.path.exists(p)), candidates[0])
 
         self.device = torch.device("cuda")
         self.model = Wav2Lip().to(self.device).eval()
 
         ckpt = torch.load(model_path, map_location="cpu")
         state = ckpt.get("state_dict", ckpt)
+
+        # Strip "module." prefix if present (DataParallel wrapper)
+        if any(k.startswith("module.") for k in state.keys()):
+            state = {k.removeprefix("module."): v for k, v in state.items()}
+
         self.model.load_state_dict(state)
         print(f"[Wav2Lip] Loaded checkpoint from {model_path}")
 
@@ -39,41 +48,41 @@ class Wav2LipInferenceEngine:
         """Run Wav2Lip inference for a single frame.
 
         Args:
-            face_stack: (1, 6, 96, 96) float32 on CPU, 2-frame RGB stack in [0, 1]
-            mel:        (1, 1, 80, 16) float32 on CPU, log-mel
+            face_stack: (1, 6, 96, 96) float32 on CPU, in [0, 1]
+            mel:        (1, 1, 80, 16) float32 on CPU, log-mel in [-4, 4]
         Returns:
             rendered: (96, 96, 3) uint8 BGR image
         """
         with torch.no_grad():
             self._face.copy_(face_stack)
             self._mel.copy_(mel)
-            out = self.model(self._mel, self._face)  # (1, 3, 96, 96) RGB [0, 1]
+            out = self.model(self._mel, self._face)  # (1, 3, 96, 96) [0, 1]
 
         out = out.float().cpu().numpy().squeeze(0)           # (3, 96, 96)
         out = np.clip(out, 0.0, 1.0)
-        out = (out * 255).astype(np.uint8).transpose(1, 2, 0)  # (96, 96, 3) RGB
-        out = cv2.cvtColor(out, cv2.COLOR_RGB2BGR)
+        out = (out * 255).astype(np.uint8).transpose(1, 2, 0)  # (96, 96, 3) BGR
         return out
 
 
-def preprocess_face_wav2lip(face_bgr_96, prev_face_rgb_norm=None):
-    """Convert a 96x96 BGR face crop to Wav2Lip input tensors.
+def preprocess_face_wav2lip(face_bgr_96):
+    """Convert a 96x96 BGR face crop to Wav2Lip input tensor.
+
+    Official convention: stack [lower-half-masked face, full face] as 6 BGR channels, /255.
+    Model was trained with BGR (OpenCV native), NOT RGB.
 
     Args:
         face_bgr_96: (96, 96, 3) uint8 BGR face crop
-        prev_face_rgb_norm: (3, 96, 96) float32 [0,1] from previous frame, or None
     Returns:
         face_stack: (6, 96, 96) float32 tensor
-        current_rgb_norm: (3, 96, 96) float32, to pass as prev_face next frame
     """
-    face_rgb = cv2.cvtColor(face_bgr_96, cv2.COLOR_BGR2RGB)
-    face_norm = face_rgb.astype(np.float32) / 255.0  # -> [0, 1]
-    current = torch.from_numpy(face_norm).permute(2, 0, 1)     # (3, 96, 96)
+    # Zero out lower half (rows 48:96) — official approach
+    face_masked = face_bgr_96.copy()
+    face_masked[48:, :, :] = 0
 
-    if prev_face_rgb_norm is None:
-        prev = current
-    else:
-        prev = torch.from_numpy(prev_face_rgb_norm)
+    face_norm = face_bgr_96.astype(np.float32) / 255.0
+    masked_norm = face_masked.astype(np.float32) / 255.0
 
-    stacked = torch.cat([current, prev], dim=0)  # (6, 96, 96)
-    return stacked, face_norm.transpose(2, 0, 1)  # return CHW for next frame
+    # (96, 96, 6) = [masked_lower_BGR, full_BGR]
+    stacked = np.concatenate([masked_norm, face_norm], axis=-1)
+    return torch.from_numpy(stacked).permute(2, 0, 1)  # (6, 96, 96)
+
