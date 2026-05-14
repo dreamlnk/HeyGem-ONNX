@@ -36,6 +36,7 @@ class TCPStreamingClient:
         self.size = size
         self.width = WIDTH
         self.height = HEIGHT
+        self._detect_status = '---'
         self.latency_history = []
         self.frame_count = 0
         self.sock = None
@@ -69,16 +70,25 @@ class TCPStreamingClient:
                 self.sock.sendall(hdr + data)
                 result_len = struct.unpack("<I", self._recv_exact(4))[0]
                 if result_len == 0:
-                    return None
+                    # No face detected — draw red X indicator
+                    cv2.line(frame_bgr, (w//2-20, h//2-20), (w//2+20, h//2+20), (0, 0, 255), 2)
+                    cv2.line(frame_bgr, (w//2+20, h//2-20), (w//2-20, h//2+20), (0, 0, 255), 2)
+                    self._detect_status = 'FAIL'
+                    return frame_bgr
                 payload = self._recv_exact(result_len)
                 expected_len = 8 + self.size * self.size * 3
                 if result_len >= expected_len:
                     cx1, cy1, cx2, cy2 = struct.unpack("<hhhh", payload[:8])
                     rendered = np.frombuffer(payload[8:expected_len], dtype=np.uint8).reshape(self.size, self.size, 3)
+                    # Draw green detection rectangle on output
+                    cv2.rectangle(frame_bgr, (cx1, cy1), (cx2, cy2), (0, 255, 0), 2)
+                    self._detect_status = 'OK'
                     return self._composite_face(frame_bgr, rendered, cx1, cy1, cx2, cy2)
+                self._detect_status = 'SIZE'
                 return None
             except Exception:
                 self.sock = None
+                self._detect_status = 'ERR'
                 return None
 
     def _composite_face(self, frame, rendered, cx1, cy1, cx2, cy2):
@@ -396,7 +406,7 @@ class TCPStreamingClient:
 
             if self.frame_count % 30 == 0:
                 avg = np.mean(self.latency_history)
-                print(f"\rFPS: {1000/avg:.1f} | 延迟: {avg:.0f}ms | #{self.frame_count}", end="")
+                print(f"\rFPS: {1000/avg:.1f} | 延迟: {avg:.0f}ms | 人脸: {self._detect_status} | #{self.frame_count}", end="")
 
             if cam_output is not None:
                 try:
