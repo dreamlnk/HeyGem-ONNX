@@ -95,18 +95,20 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--test-audio", action="store_true", help="使用振荡测试音频验证唇形")
+    parser.add_argument("--size", type=int, default=96, choices=[96, 256], help="模型分辨率 (默认96)")
     args = parser.parse_args()
 
     with open("D:/HeyGem ONNX/HeyGem-Linux-Python-Hack-RTX-50/debug_main.log", "w") as f:
         f.write(f"Server starting, PID: {os.getpid()}\n")
         f.write(f"CWD: {os.getcwd()}\n")
         f.write(f"Script: {__file__}\n")
+        f.write(f"Size: {args.size}\n")
     print("=" * 60, flush=True)
-    print("HeyGem TCP", flush=True)
+    print(f"HeyGem TCP ({args.size}×{args.size})", flush=True)
     print("=" * 60, flush=True)
 
-    print("Loading pipeline...", flush=True)
-    pipeline = StreamingPipeline(detect_interval=2, test_audio=args.test_audio)
+    print(f"Loading pipeline ({args.size}×{args.size})...", flush=True)
+    pipeline = StreamingPipeline(detect_interval=2, test_audio=args.test_audio, size=args.size)
     pipeline.start()
     if args.test_audio:
         pipeline.feed_test_audio()

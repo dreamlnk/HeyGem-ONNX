@@ -23,7 +23,8 @@ AUDIO_CHUNK_SECONDS = 0.5
 
 class TCPStreamingClient:
     def __init__(self, video_path=None, use_virtualcam=False, loop=False,
-                 use_mic=False, portrait=False, obs_win=False, audio_path=None):
+                 use_mic=False, portrait=False, obs_win=False, audio_path=None,
+                 size=96):
         self.running = False
         self.video_path = video_path
         self.audio_path = audio_path
@@ -32,6 +33,7 @@ class TCPStreamingClient:
         self.use_mic = use_mic
         self.obs_win = obs_win
         self.portrait = portrait
+        self.size = size
         self.width = WIDTH
         self.height = HEIGHT
         self.latency_history = []
@@ -69,16 +71,17 @@ class TCPStreamingClient:
                 if result_len == 0:
                     return None
                 payload = self._recv_exact(result_len)
-                if result_len >= 27656:
+                expected_len = 8 + self.size * self.size * 3
+                if result_len >= expected_len:
                     cx1, cy1, cx2, cy2 = struct.unpack("<hhhh", payload[:8])
-                    rendered_96 = np.frombuffer(payload[8:27656], dtype=np.uint8).reshape(96, 96, 3)
-                    return self._composite_face(frame_bgr, rendered_96, cx1, cy1, cx2, cy2)
+                    rendered = np.frombuffer(payload[8:expected_len], dtype=np.uint8).reshape(self.size, self.size, 3)
+                    return self._composite_face(frame_bgr, rendered, cx1, cy1, cx2, cy2)
                 return None
             except Exception:
                 self.sock = None
                 return None
 
-    def _composite_face(self, frame, rendered_96, cx1, cy1, cx2, cy2):
+    def _composite_face(self, frame, rendered, cx1, cy1, cx2, cy2):
         """Apply Wav2Lip mouth changes to original sharp face using delta blending.
         Uses an elliptical mask with wide, smooth feathering to avoid visible edges."""
         H, W = frame.shape[:2]
@@ -88,10 +91,10 @@ class TCPStreamingClient:
         if crop_w < 5 or crop_h < 5:
             return frame
         orig_crop = frame[cy1:cy2, cx1:cx2].astype(np.float32)
-        # Compute delta at 96x96
-        orig_96 = cv2.resize(orig_crop, (96, 96), interpolation=cv2.INTER_AREA)
-        delta_96 = rendered_96.astype(np.float32) - orig_96
-        delta_up = cv2.resize(delta_96, (crop_w, crop_h), interpolation=cv2.INTER_CUBIC)
+        # Compute delta at model resolution
+        orig_resized = cv2.resize(orig_crop, (self.size, self.size), interpolation=cv2.INTER_AREA)
+        delta = rendered.astype(np.float32) - orig_resized
+        delta_up = cv2.resize(delta, (crop_w, crop_h), interpolation=cv2.INTER_CUBIC)
         enhanced = orig_crop + delta_up
         # Elliptical mask centered on mouth, with heavy Gaussian feather
         cx, cy = crop_w / 2.0, crop_h * 0.72  # mouth center
@@ -413,7 +416,7 @@ class TCPStreamingClient:
 
     def start(self):
         print("=" * 50)
-        print("HeyGem Live TCP Client")
+        print(f"HeyGem Live TCP Client ({self.size}×{self.size})")
         print("=" * 50)
         print(f"Server: {WSL_HOST}:{WSL_PORT}")
 
@@ -542,6 +545,7 @@ if __name__ == "__main__":
     parser.add_argument("--portrait", action="store_true", help="竖屏输出 720x1280")
     parser.add_argument("--camera", type=int, default=0, help="摄像头ID")
     parser.add_argument("--audio", type=str, default=None, help="独立音频文件路径")
+    parser.add_argument("--size", type=int, default=96, choices=[96, 256], help="模型分辨率 (默认96)")
     args = parser.parse_args()
     if args.video:
         CAMERA_ID = None
@@ -549,4 +553,5 @@ if __name__ == "__main__":
         CAMERA_ID = args.camera
     TCPStreamingClient(video_path=args.video, use_virtualcam=args.virtualcam,
                        loop=args.loop, use_mic=args.mic,
-                       portrait=args.portrait, audio_path=args.audio).start()
+                       portrait=args.portrait, audio_path=args.audio,
+                       size=args.size).start()

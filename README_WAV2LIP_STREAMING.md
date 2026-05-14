@@ -15,13 +15,13 @@
 
 ## 核心技术
 
-### Wav2Lip 模型 (96×96, FP32)
+### Wav2Lip 模型 (96×96 / 256×256, FP32)
 ```
-输入: 人脸96×96 (6通道=[masked_lower_BGR, full_BGR]) + 梅尔频谱(1,80,16)
-  ┌─ Face Encoder:  5层conv stride=2, 6ch→512ch, 96→3
+输入: 人脸S×S (6通道=[masked_lower_BGR, full_BGR]) + 梅尔频谱(1,80,16)
+  ┌─ Face Encoder: 7-8层conv stride=2, 6ch→512ch, S→1
   ├─ Audio Encoder: 4层conv stride=2, 1ch→512ch, (80,16)→(5,1)
-  └─ Decoder:       5层转置卷积, 512ch→3ch, 3→96
-输出: 唇同步人脸 96×96 BGR
+  └─ Decoder:       7-8层转置卷积, 512ch→3ch, 1→S
+输出: 唇同步人脸 S×S BGR (S=96 or 256)
 ```
 
 ### 音频处理
@@ -51,44 +51,50 @@
 
 ## 性能指标
 
-| 指标 | 数值 |
-|------|------|
-| 推理延迟 | ~15ms/帧 (GTX 1080 Ti) |
-| 口部运动量 | 9.6%/255 (人眼清晰可见, 阈值6%) |
-| 帧率自适应 | 25fps (视频) / 30fps (摄像头) |
-| 网络带宽 | ~700KB/s (TCP BGR原始流) |
-| 模型权重 | 436MB (wav2lip_gan.pth) |
-| 音频采样率 | 16000Hz |
+| 指标 | 96×96 | 256×256 |
+|------|-------|---------|
+| 推理延迟 | ~15ms/帧 | ~15-25ms/帧 |
+| 口部运动量 | 9.6%/255 (人眼清晰可见, 阈值6%) | 同等或更优 |
+| 口部清晰度 | 基准 | ~7×像素提升 |
+| 帧率自适应 | 25fps (视频) / 30fps (摄像头) | 25fps (视频) / 30fps (摄像头) |
+| 网络带宽 | ~700KB/s (TCP BGR原始流) | ~5.3MB/s |
+| 模型权重 | 436MB (wav2lip_gan.pth) | 205MB (wav2lip256.pth) |
+| 音频采样率 | 16000Hz | 16000Hz |
 
 ## 快速开始
 
 ### 1. 启动服务端 (WSL/Linux)
 ```bash
 cd "D:/HeyGem ONNX/HeyGem-Linux-Python-Hack-RTX-50"
+# 96×96 模式 (默认)
 python stream_server_tcp.py
+# 256×256 模式 (更高清晰度)
+python stream_server_tcp.py --size 256
 ```
 等待模型加载完成, 看到 "监听端口 7863..." 即可。
 
 ### 2. 启动客户端 (Windows)
 
+**注意**: 客户端 `--size` 参数必须与服务端一致。
+
 **摄像头 + 麦克风 (实时数字人)**
 ```bash
-python windows_client_tcp.py --mic
+python windows_client_tcp.py --mic [--size 256]
 ```
 
 **视频文件 + 麦克风 (视频画面+实时口型)**
 ```bash
-python windows_client_tcp.py --video input.mp4 --loop --mic
+python windows_client_tcp.py --video input.mp4 --loop --mic [--size 256]
 ```
 
 **视频文件 + 独立音频**
 ```bash
-python windows_client_tcp.py --video input.mp4 --audio audio.mp3 --loop
+python windows_client_tcp.py --video input.mp4 --audio audio.mp3 --loop [--size 256]
 ```
 
 **虚拟摄像头模式 (OBS推流)**
 ```bash
-python windows_client_tcp.py --video input.mp4 --virtualcam --loop --mic
+python windows_client_tcp.py --video input.mp4 --virtualcam --loop --mic [--size 256]
 ```
 
 **全部参数**
@@ -113,10 +119,14 @@ windows_client_tcp.py          # Windows客户端入口
 pipeline_wav2lip.py            # 流式管线 (检测→裁剪→推理)
 phase1_scrfd_test.py           # YuNet人脸检测
 phase2_audio_wav2lip.py        # 梅尔频谱提取
-phase4_wav2lip.py              # Wav2Lip推理引擎
-models_wav2lip/wav2lip.py      # 模型定义
+phase4_wav2lip.py              # Wav2Lip推理引擎 (支持96/256)
+models_wav2lip/
+  ├─ wav2lip.py                # 96×96 模型定义
+  ├─ wav2lip256.py             # 256×256 模型定义
+  └─ conv.py                   # Conv2d/Conv2dTranspose 基础模块
 pretrain_models/               # 权重文件目录
-  └─ wav2lip_gan.pth          # Wav2Lip GAN权重 (~436MB)
+  ├─ wav2lip_gan.pth          # 96×96 权重 (~436MB)
+  └─ wav2lip256.pth           # 256×256 权重 (~205MB)
 ```
 
 ## 协议

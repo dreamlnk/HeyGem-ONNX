@@ -48,16 +48,17 @@ def _create_feather_mask(h, w, feather_ratio=0.18):
 # ---------------------------------------------------------------------------
 
 class StreamingPipeline:
-    def __init__(self, detect_interval=3, test_audio=False):
+    def __init__(self, detect_interval=3, test_audio=False, size=96):
+        self.size = size
         print("=" * 60)
-        print("Wav2Lip Streaming Pipeline")
+        print(f"Wav2Lip Streaming Pipeline ({size}×{size})")
         print("=" * 60)
 
         print("  Loading YuNet...")
         self.detector = scrfd_load()
 
-        print("  Loading Wav2Lip...")
-        self.wav2lip = Wav2LipInferenceEngine()
+        print(f"  Loading Wav2Lip ({size}×{size})...")
+        self.wav2lip = Wav2LipInferenceEngine(size=size)
 
         self.test_audio = test_audio
         self.detect_interval = detect_interval
@@ -265,43 +266,44 @@ class StreamingPipeline:
         crop_h, crop_w = face_crop.shape[:2]
 
         # --- 3. Preprocess for Wav2Lip ---
-        face_96 = cv2.resize(face_crop, (96, 96), interpolation=cv2.INTER_AREA)
-        face_stack = preprocess_face_wav2lip(face_96)
+        face_resized = cv2.resize(face_crop, (self.size, self.size), interpolation=cv2.INTER_AREA)
+        face_stack = preprocess_face_wav2lip(face_resized, size=self.size)
 
         # --- 4. Get mel input ---
         mel_input = torch.from_numpy(self._get_mel_input())
 
         # --- 5. Wav2Lip inference ---
         with self.wav2lip_lock:
-            rendered_96 = self.wav2lip.infer(face_stack.unsqueeze(0), mel_input)
+            rendered = self.wav2lip.infer(face_stack.unsqueeze(0), mel_input)
 
-        # Return rendered 96x96 face + crop coords.
+        # Return rendered face + crop coords.
         # Client computes delta = rendered - original_downscaled locally (no clipping).
+        half = self.size // 2
         if self.frame_idx == 1:
             cv2.imwrite("debug_face_crop.png", face_crop)
-            cv2.imwrite("debug_rendered_f1.png", rendered_96)
+            cv2.imwrite("debug_rendered_f1.png", rendered)
             with open("debug_pipeline.txt", "a") as df:
-                df.write(f"F1 crop={crop_w}x{crop_h} rect=({cx1},{cy1})-({cx2},{cy2})\n")
+                df.write(f"F1 size={self.size} crop={crop_w}x{crop_h} rect=({cx1},{cy1})-({cx2},{cy2})\n")
         if self.frame_idx == 30:
-            cv2.imwrite("debug_rendered_f30.png", rendered_96)
+            cv2.imwrite("debug_rendered_f30.png", rendered)
             with open("debug_pipeline.txt", "a") as df:
-                df.write(f"F30 crop={crop_w}x{crop_h} rect=({cx1},{cy1})-({cx2},{cy2})\n")
+                df.write(f"F30 size={self.size} crop={crop_w}x{crop_h} rect=({cx1},{cy1})-({cx2},{cy2})\n")
                 if os.path.exists("debug_rendered_f1.png"):
                     f1 = cv2.imread("debug_rendered_f1.png")
                     if f1 is not None:
-                        diff = np.abs(f1.astype(float) - rendered_96.astype(float))
-                        df.write(f"F1vsF30 diff: mean={diff.mean():.1f}/255 max={diff.max():.0f}/255 mouth_mean={diff[48:,:,:].mean():.1f}/255\n")
+                        diff = np.abs(f1.astype(float) - rendered.astype(float))
+                        df.write(f"F1vsF30 diff: mean={diff.mean():.1f}/255 max={diff.max():.0f}/255 mouth_mean={diff[half:,:,:].mean():.1f}/255\n")
         if self._last_rendered_96 is not None and self.frame_idx <= 5:
-            diff = np.abs(rendered_96.astype(float) -
+            diff = np.abs(rendered.astype(float) -
                           self._last_rendered_96.astype(float)).mean()
-            mouth = rendered_96[48:, :, :]
-            mouth_prev = self._last_rendered_96[48:, :, :]
+            mouth = rendered[half:, :, :]
+            mouth_prev = self._last_rendered_96[half:, :, :]
             mouth_diff = np.abs(mouth.astype(float) - mouth_prev.astype(float)).mean()
             with open("debug_pipeline.txt", "a") as df:
                 df.write(f"F{self.frame_idx} df={diff:.1f} mouth_df={mouth_diff:.1f}\n")
-        self._last_rendered_96 = rendered_96.copy()
+        self._last_rendered_96 = rendered.copy()
 
-        return rendered_96, (cx1, cy1, cx2, cy2)
+        return rendered, (cx1, cy1, cx2, cy2)
 
     # ------------------------------------------------------------------
     # Lifecycle
