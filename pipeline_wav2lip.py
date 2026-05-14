@@ -24,6 +24,40 @@ from phase4_wav2lip import Wav2LipInferenceEngine, preprocess_face_wav2lip
 
 
 # ---------------------------------------------------------------------------
+# Canonical face landmarks for alignment (normalized 0-1, then scaled)
+# YuNet 5-point order: left_eye, right_eye, nose, left_mouth, right_mouth
+# ---------------------------------------------------------------------------
+
+def _canonical_landmarks(size):
+    """Return canonical 5-point landmarks at given image size."""
+    pts = np.array([
+        [0.35, 0.38],   # left eye
+        [0.65, 0.38],   # right eye
+        [0.50, 0.56],   # nose tip
+        [0.35, 0.73],   # left mouth corner
+        [0.65, 0.73],   # right mouth corner
+    ], dtype=np.float32)
+    return pts * size
+
+
+def _compute_align_transform(src_pts, dst_pts):
+    """Compute similarity transform (4-DOF: rotation, uniform scale, translation).
+    Returns 2×3 affine matrix, or None if src_pts are degenerate."""
+    if src_pts.shape != (5, 2) or dst_pts.shape != (5, 2):
+        return None
+    # Check for degenerate points (all same, collinear, etc.)
+    src_std = src_pts.std(axis=0)
+    if src_std[0] < 2 or src_std[1] < 2:
+        return None
+    try:
+        M = cv2.estimateAffinePartial2D(src_pts, dst_pts, method=cv2.RANSAC,
+                                         ransacReprojThreshold=3.0)[0]
+        return M  # None if estimation fails
+    except cv2.error:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Compositing helpers
 # ---------------------------------------------------------------------------
 
@@ -48,8 +82,12 @@ def _create_feather_mask(h, w, feather_ratio=0.18):
 # ---------------------------------------------------------------------------
 
 class StreamingPipeline:
-    def __init__(self, detect_interval=3, test_audio=False, size=96):
+    def __init__(self, detect_interval=3, test_audio=False, size=96, use_align=None):
         self.size = size
+        # Auto-enable alignment for 256, disable for 96
+        if use_align is None:
+            use_align = (size >= 256)
+        self.use_align = use_align
         print("=" * 60)
         print(f"Wav2Lip Streaming Pipeline ({size}×{size})")
         print("=" * 60)
@@ -73,8 +111,12 @@ class StreamingPipeline:
         self.last_bbox = None
         self.last_kps = None
         self._bbox_history = []  # rolling buffer of (x1,y1,x2,y2) for smoothing
+        self._kps_history = []   # rolling buffer of keypoints for smoothing
 
-        # (No prev_face needed — Wav2Lip uses [masked_lower, full_face] stacking, not temporal)
+        # Face alignment
+        if self.use_align:
+            self._canonical_lm = _canonical_landmarks(size)
+            print(f"  Face alignment: ENABLED (similarity transform via 5-point landmarks)")
 
         # CUDA inference lock
         self.wav2lip_lock = threading.Lock()
@@ -223,8 +265,7 @@ class StreamingPipeline:
                 self.last_bbox = None
                 self.last_kps = None
                 self._bbox_history.clear()
-                if hasattr(self, '_kps_history'):
-                    self._kps_history.clear()
+                self._kps_history.clear()
 
         if self.last_bbox is None:
             return None, None
@@ -233,8 +274,7 @@ class StreamingPipeline:
             self.last_bbox = None
             self.last_kps = None
             self._bbox_history.clear()
-            if hasattr(self, '_kps_history'):
-                self._kps_history.clear()
+            self._kps_history.clear()
             return None, None
 
         # --- 2. Crop face region (bbox center, square, symmetric padding) ---
@@ -247,12 +287,12 @@ class StreamingPipeline:
         bw, bh = x2 - x1, y2 - y1
         cx = x1 + bw / 2.0
         cy = y1 + bh / 2.0 - bh * 0.05  # slight upward shift
-        size = max(bw, bh) * 1.1
-        half = size / 2.0
-        cx1 = int(cx - half)
-        cy1 = int(cy - half)
-        cx2 = int(cx + half)
-        cy2 = int(cy + half)
+        crop_sz = max(bw, bh) * 1.1
+        crop_half = crop_sz / 2.0
+        cx1 = int(cx - crop_half)
+        cy1 = int(cy - crop_half)
+        cx2 = int(cx + crop_half)
+        cy2 = int(cy + crop_half)
 
         cx1 = max(0, cx1)
         cy1 = max(0, cy1)
@@ -265,16 +305,56 @@ class StreamingPipeline:
         face_crop = frame_bgr[cy1:cy2, cx1:cx2].copy()
         crop_h, crop_w = face_crop.shape[:2]
 
-        # --- 3. Preprocess for Wav2Lip ---
-        face_resized = cv2.resize(face_crop, (self.size, self.size), interpolation=cv2.INTER_AREA)
-        face_stack = preprocess_face_wav2lip(face_resized, size=self.size)
+        # --- 3. Face alignment (only for 256+ models) ---
+        M_align = None
+        if self.use_align and self.last_kps is not None:
+            # Convert keypoints to crop-relative coordinates
+            kps_img = self.last_kps.reshape(-1, 2).astype(np.float32)
+            kps_crop = kps_img.copy()
+            kps_crop[:, 0] -= cx1
+            kps_crop[:, 1] -= cy1
 
-        # --- 4. Get mel input ---
+            # Smooth keypoints
+            self._kps_history.append(kps_crop.copy())
+            if len(self._kps_history) > 5:
+                self._kps_history.pop(0)
+            kps_smooth = np.mean(self._kps_history, axis=0)
+
+            # Compute alignment transform: crop coords → canonical coords
+            M_align = _compute_align_transform(kps_smooth, self._canonical_lm)
+
+        # --- 4. Preprocess for Wav2Lip ---
+        if M_align is not None:
+            # Warp face crop to canonical position (aligned)
+            face_aligned = cv2.warpAffine(face_crop, M_align, (self.size, self.size),
+                                           flags=cv2.INTER_LINEAR,
+                                           borderMode=cv2.BORDER_REPLICATE)
+            # Compute inverse transform to restore original position after inference
+            M_inv = cv2.invertAffineTransform(M_align)
+        else:
+            # Fallback: simple resize (no alignment)
+            face_aligned = cv2.resize(face_crop, (self.size, self.size),
+                                       interpolation=cv2.INTER_AREA)
+            M_inv = None
+
+        face_stack = preprocess_face_wav2lip(face_aligned, size=self.size)
+
+        # --- 5. Get mel input ---
         mel_input = torch.from_numpy(self._get_mel_input())
 
-        # --- 5. Wav2Lip inference ---
+        # --- 6. Wav2Lip inference ---
         with self.wav2lip_lock:
             rendered = self.wav2lip.infer(face_stack.unsqueeze(0), mel_input)
+
+        # --- 7. Restore original face position ---
+        if M_inv is not None:
+            # Warp rendered back to original crop coordinates
+            rendered_unaligned = cv2.warpAffine(rendered, M_inv, (crop_w, crop_h),
+                                                  flags=cv2.INTER_LINEAR,
+                                                  borderMode=cv2.BORDER_REPLICATE)
+            # Resize to model size for client delta compositing compatibility
+            rendered = cv2.resize(rendered_unaligned, (self.size, self.size),
+                                    interpolation=cv2.INTER_AREA)
 
         # Return rendered face + crop coords.
         # Client computes delta = rendered - original_downscaled locally (no clipping).
