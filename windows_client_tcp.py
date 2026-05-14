@@ -136,6 +136,8 @@ class TCPStreamingClient:
                 data = audio_np.astype(np.float32).tobytes()
                 hdr = struct.pack("<BI", 1, len(data))
                 self.sock.sendall(hdr + data)
+                if self.frame_count % 30 == 0:
+                    print(f"\r  [AUDIO SEND] {len(audio_np)} samples, max={audio_np.max():.3f}", end="")
             except Exception:
                 self.sock = None
 
@@ -211,10 +213,9 @@ class TCPStreamingClient:
                 pass
 
     def _capture_audio_from_video(self, audio_queue):
-        """从视频文件提取音频并发送"""
+        """从视频文件提取音频，加载到流式缓冲区"""
         try:
             import tempfile, subprocess, os as _os
-            # 先检查视频是否有音频流
             probe = subprocess.run(
                 f'ffprobe -v error -select_streams a:0 -show_entries stream=codec_type '
                 f'-of default=noprint_wrappers=1:nokey=1 "{self.video_path}"',
@@ -234,17 +235,11 @@ class TCPStreamingClient:
                 return
             import librosa
             audio, sr = librosa.load(audio_path, sr=AUDIO_SAMPLE_RATE, mono=True)
-            audio_f32 = audio.astype(np.float32)
-            # 一次性发送全部音频
-            audio_queue.put(audio_f32)
-            print(f"  视频音频已提取: {len(audio)/sr:.0f}s")
-            # 本地播放音频
-            try:
-                import sounddevice as sd
-                sd.play(audio_f32, samplerate=AUDIO_SAMPLE_RATE)
-                print(f"  音频播放中...")
-            except Exception:
-                print("  [提示] sounddevice未安装，无法本地播放音频")
+            # 加载到流式缓冲区（与 _load_external_audio 一致）
+            self._external_audio = audio.astype(np.float32)
+            self._audio_pos = 0
+            self._audio_play_pending = True
+            print(f"  视频音频已提取: {len(self._external_audio)/sr:.0f}s (流式发送)")
             _os.remove(audio_path)
         except Exception as e:
             print(f"  音频提取失败: {e}")
@@ -253,12 +248,16 @@ class TCPStreamingClient:
         """加载外部音频文件 (mp3/wav), 重采样到16kHz, 分块流式发送"""
         try:
             import tempfile, subprocess, os as _os
-            if not _os.path.exists(self.audio_path):
-                print(f"  [错误] 音频文件不存在: {self.audio_path}")
+            # 相对路径解析到脚本目录
+            audio_path = self.audio_path
+            if not _os.path.isabs(audio_path):
+                audio_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), audio_path)
+            if not _os.path.exists(audio_path):
+                print(f"  [错误] 音频文件不存在: {audio_path}")
                 return
             audio_wav = _os.path.join(tempfile.gettempdir(), "_heygem_ext_audio.wav")
             subprocess.run(
-                f'ffmpeg -y -i "{self.audio_path}" -ac 1 -ar {AUDIO_SAMPLE_RATE} '
+                f'ffmpeg -y -i "{audio_path}" -ac 1 -ar {AUDIO_SAMPLE_RATE} '
                 f'"{audio_wav}"',
                 shell=True, capture_output=True, timeout=30,
             )
@@ -328,19 +327,10 @@ class TCPStreamingClient:
         reconnect_interval = 100
         self._connect()
 
-        # 视频模式下等音频提取完一次性发送
-        video_audio_sent = False
-
         while self.running:
             try:
                 frame = frame_queue.get(timeout=1)
             except queue.Empty:
-                # 等待音频期间也检查音频队列
-                if (self.video_path or self.audio_path) and not self.use_mic and not video_audio_sent and not audio_queue.empty():
-                    audio_data = audio_queue.get()
-                    self._send_audio(audio_data)
-                    video_audio_sent = True
-                    print(f"\r  视频音频已发送: {len(audio_data)}样点  ", end="")
                 if (self.video_path or self.audio_path) and frame_queue.qsize() == 0 and not self.loop:
                     print("\n视频播放完毕")
                     self.running = False
@@ -349,21 +339,19 @@ class TCPStreamingClient:
 
             t0 = time.perf_counter()
 
-            # 外部音频: 视频帧号驱动, 与视频精确同步
-            if self.audio_path and hasattr(self, '_external_audio') and self._external_audio is not None:
-                # 音频播完且视频循环 → 重新开始
+            # 流式音频: 视频帧号驱动, 与视频精确同步
+            has_stream_audio = hasattr(self, '_external_audio') and self._external_audio is not None
+            if has_stream_audio:
                 if self._audio_pos >= len(self._external_audio) and self.loop:
                     self._audio_pos = 0
                     self._send_reset()
-                    print("\r  音频循环...", end="")
-                # 用视频帧号计算目标音频位置 (帧率同步, 不依赖墙上时钟)
+                    if self.frame_count % 150 == 0:
+                        print("\r  音频循环...", end="")
                 fps = getattr(self, '_video_fps', 25) or 25
                 target_pos = int(self.frame_count / fps * AUDIO_SAMPLE_RATE)
-                # 本地音频播放: 从当前视频位置开始(对齐画面)
                 if getattr(self, '_audio_play_pending', False) and self.frame_count >= 3:
                     try:
                         import sounddevice as sd
-                        fps = getattr(self, '_video_fps', 25) or 25
                         start_sample = int(self.frame_count / fps * AUDIO_SAMPLE_RATE)
                         sd.play(self._external_audio[start_sample:], samplerate=AUDIO_SAMPLE_RATE)
                     except Exception:
@@ -374,13 +362,9 @@ class TCPStreamingClient:
                     chunk = self._external_audio[self._audio_pos:chunk_end]
                     if len(chunk) > 0:
                         self._send_audio(chunk)
+                        if self.frame_count % 90 == 0:
+                            print(f"\r  音频流: pos={self._audio_pos}/{len(self._external_audio)} chunk={len(chunk)}", end="")
                     self._audio_pos = chunk_end
-            # 视频自带音频: 一次性发送
-            elif self.video_path and not self.use_mic and not video_audio_sent and not audio_queue.empty():
-                audio_data = audio_queue.get()
-                self._send_audio(audio_data)
-                video_audio_sent = True
-                print(f"\r  视频音频已发送: {len(audio_data)}样点  ", end="")
 
             # 麦克风模式下持续发送音频
             if self.use_mic or not self.video_path:
