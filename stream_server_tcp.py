@@ -101,6 +101,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--test-audio", action="store_true", help="使用振荡测试音频验证唇形")
     parser.add_argument("--size", type=int, default=96, choices=[96, 256], help="模型分辨率 (默认96)")
+    parser.add_argument("--no-align", action="store_true", help="禁用面部对齐")
     args = parser.parse_args()
 
     with open(LOG_MAIN, "w") as f:
@@ -113,7 +114,9 @@ def main():
     print("=" * 60, flush=True)
 
     print(f"Loading pipeline ({args.size}×{args.size})...", flush=True)
-    pipeline = StreamingPipeline(detect_interval=2, test_audio=args.test_audio, size=args.size)
+    use_align = False if args.no_align else None
+    pipeline = StreamingPipeline(detect_interval=2, test_audio=args.test_audio, size=args.size,
+                                  use_align=use_align)
     pipeline.start()
     if args.test_audio:
         pipeline.feed_test_audio()
