@@ -116,7 +116,7 @@ def main():
 
     print(f"Loading pipeline ({args.size}×{args.size})...", flush=True)
     use_align = False if args.no_align else None
-    pipeline = StreamingPipeline(detect_interval=2, test_audio=args.test_audio, size=args.size,
+    pipeline = StreamingPipeline(detect_interval=3, test_audio=args.test_audio, size=args.size,
                                   use_align=use_align, use_fp16=not args.fp32)
     pipeline.start()
     if args.test_audio:
