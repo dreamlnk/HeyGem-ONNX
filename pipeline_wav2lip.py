@@ -258,8 +258,13 @@ class StreamingPipeline:
         do_detect = (self.frame_idx % self.detect_interval == 0) or (self.last_bbox is None)
         if do_detect:
             t_d0 = time.perf_counter()
-            # YuNet on CPU at native resolution is too slow — use fixed 640
-            det_w, det_h = 640, 640
+            # Detector at fixed 640 — preserve aspect ratio to avoid distortion
+            det_long = 640
+            if W >= H:
+                det_w, det_h = det_long, int(H * det_long / W)
+            else:
+                det_h, det_w = det_long, int(W * det_long / H)
+            det_w, det_h = max(det_w, 32), max(det_h, 32)
             det_frame = cv2.resize(frame_bgr, (det_w, det_h), interpolation=cv2.INTER_AREA)
             bboxes, kpss, _ = scrfd_detect(self.detector, det_frame)
             # Scale bboxes/keypoints back to original frame coordinates
