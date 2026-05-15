@@ -90,7 +90,13 @@ class TCPStreamingClient:
                     rendered = np.frombuffer(payload[8:expected_len], dtype=np.uint8).reshape(self.size, self.size, 3)
                     cv2.rectangle(frame_bgr, (cx1, cy1), (cx2, cy2), (0, 255, 0), 2)
                     self._detect_status = 'OK'
-                    return self._composite_face(frame_bgr, rendered, cx1, cy1, cx2, cy2)
+                    frame_bgr = self._composite_face(frame_bgr, rendered, cx1, cy1, cx2, cy2)
+                    # Draw mouth delta value on screen
+                    md = getattr(self, '_mouth_delta', 0)
+                    color = (0, 255, 0) if md > 3 else (0, 200, 255) if md > 1 else (0, 0, 255)
+                    cv2.putText(frame_bgr, f"Mouth d: {md:.1f}/255", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
+                    return frame_bgr
                 self._draw_status(frame_bgr, f"SIZE {result_len}!={expected_len}", (0, 200, 255))
                 self._detect_status = 'SIZE'
                 return frame_bgr
@@ -113,6 +119,9 @@ class TCPStreamingClient:
         # Compute delta at model resolution
         orig_resized = cv2.resize(orig_crop, (self.size, self.size), interpolation=cv2.INTER_AREA)
         delta = rendered.astype(np.float32) - orig_resized
+        half = self.size // 2
+        mouth_delta = np.abs(delta[half:, :, :]).mean()
+        self._mouth_delta = mouth_delta
         delta_up = cv2.resize(delta, (crop_w, crop_h), interpolation=cv2.INTER_CUBIC)
         enhanced = orig_crop + delta_up
         # Elliptical mask centered on mouth, with heavy Gaussian feather
@@ -398,7 +407,8 @@ class TCPStreamingClient:
 
             if self.frame_count % 30 == 0:
                 avg = np.mean(self.latency_history)
-                print(f"\rFPS: {1000/avg:.1f} | 延迟: {avg:.0f}ms | 人脸: {self._detect_status} | #{self.frame_count}", end="")
+                md = getattr(self, '_mouth_delta', 0)
+                print(f"\rFPS: {1000/avg:.1f} | 延迟: {avg:.0f}ms | 人脸: {self._detect_status} | 嘴Δ: {md:.1f}/255 | #{self.frame_count}", end="")
 
             if cam_output is not None:
                 try:
