@@ -124,14 +124,13 @@ class TCPStreamingClient:
         self._mouth_delta = mouth_delta
         delta_up = cv2.resize(delta, (crop_w, crop_h), interpolation=cv2.INTER_CUBIC)
         enhanced = orig_crop + delta_up
-        # Elliptical mask centered on mouth, with heavy Gaussian feather
-        cx, cy = crop_w / 2.0, crop_h * 0.72  # mouth center
-        rx, ry = crop_w * 0.38, crop_h * 0.25  # ellipse radii
-        yy, xx = np.ogrid[:crop_h, :crop_w]
-        dist = ((xx - cx) / rx) ** 2 + ((yy - cy) / ry) ** 2
-        mask = np.clip(1.0 - dist, 0, 1).astype(np.float32)
-        # Heavy feather to avoid visible edges
-        mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=min(crop_h, crop_w) * 0.08)
+        # Soft vertical gradient mask: full effect lower half, fade to 0 upper half
+        yy = np.arange(crop_h, dtype=np.float32).reshape(-1, 1)
+        fade_start = crop_h * 0.4  # start fading at 40% from top
+        fade_end = crop_h * 0.55   # fully masked at 55% from top
+        mask = np.clip((yy - fade_start) / max(fade_end - fade_start, 1), 0, 1)
+        mask = np.repeat(mask, crop_w, axis=1)
+        mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=crop_h * 0.06)
         mask = np.clip(mask, 0, 1)
         blended = enhanced * mask[..., None] + orig_crop * (1 - mask[..., None])
         frame[cy1:cy2, cx1:cx2] = np.clip(blended, 0, 255).astype(np.uint8)
