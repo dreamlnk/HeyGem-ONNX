@@ -258,8 +258,8 @@ class StreamingPipeline:
         do_detect = (self.frame_idx % self.detect_interval == 0) or (self.last_bbox is None)
         if do_detect:
             t_d0 = time.perf_counter()
-            # Detector at fixed long edge — preserve aspect ratio to avoid distortion
-            det_long = 480
+            # Detector at fixed long edge — preserve aspect ratio, more precise for mouth
+            det_long = 640
             if W >= H:
                 det_w, det_h = det_long, int(H * det_long / W)
             else:
