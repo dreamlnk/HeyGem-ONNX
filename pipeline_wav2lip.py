@@ -129,6 +129,8 @@ class StreamingPipeline:
         self.output_queue = queue.Queue(maxsize=30)
         self.running = False
 
+        with open("debug_pipeline.txt", "a") as df:
+            df.write(f"=== SERVER START v4 size={size} fp16={'auto' if use_fp16 else False} ===\n")
         print("  Warming up...")
         self._warmup()
         print("  Ready")
@@ -165,7 +167,7 @@ class StreamingPipeline:
             if len(self.audio_buffer) > max_samples:
                 self.audio_buffer = self.audio_buffer[-max_samples:]
 
-    def _get_mel_input(self):
+    def _get_mel_input(self, t_detect=0, t_crop=0, t_prep=0, t_infer=0, t_total=0):
         if self.test_audio:
             self.feed_test_audio()
             idx = (self.frame_idx // 15) % 2
@@ -182,7 +184,9 @@ class StreamingPipeline:
         mel_input = get_wav2lip_mel_input(mel)
         if self.frame_idx <= 5 or self.frame_idx % 30 == 0:
             with open("debug_pipeline.txt", "a") as df:
-                df.write(f"Audio F{self.frame_idx}: buf={buf_len} mel_range=[{mel.min():.2f},{mel.max():.2f}] mel_mean={mel_input.mean():.3f}\n")
+                df.write(f"F{self.frame_idx} AUDIO buf={buf_len} mel={mel_input.mean():.2f} "
+                         f"detect={t_detect:.0f}ms crop={t_crop:.1f}ms prep={t_prep:.1f}ms "
+                         f"infer={t_infer:.0f}ms total={t_total:.0f}ms\n")
         return mel_input
 
     def feed_test_audio(self):
@@ -358,7 +362,9 @@ class StreamingPipeline:
 
         # --- 5. Get mel input ---
         t_mel0 = time.perf_counter()
-        mel_input = torch.from_numpy(self._get_mel_input())
+        mel_input = torch.from_numpy(self._get_mel_input(
+            t_detect=t_detect, t_crop=t_crop, t_prep=t_prep,
+            t_infer=0, t_total=(time.perf_counter() - t0) * 1000))
         t_mel = (time.perf_counter() - t_mel0) * 1000
 
         # --- 6. Wav2Lip inference ---
