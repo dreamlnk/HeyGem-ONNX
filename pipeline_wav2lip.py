@@ -82,7 +82,8 @@ def _create_feather_mask(h, w, feather_ratio=0.18):
 # ---------------------------------------------------------------------------
 
 class StreamingPipeline:
-    def __init__(self, detect_interval=3, test_audio=False, size=96, use_align=None):
+    def __init__(self, detect_interval=3, test_audio=False, size=96, use_align=None,
+                 use_fp16=True):
         self.size = size
         # 5-point alignment too crude for any model — disabled by default
         if use_align is None:
@@ -96,7 +97,7 @@ class StreamingPipeline:
         self.detector = scrfd_load()
 
         print(f"  Loading Wav2Lip ({size}×{size})...")
-        self.wav2lip = Wav2LipInferenceEngine(size=size)
+        self.wav2lip = Wav2LipInferenceEngine(size=size, use_fp16=use_fp16)
 
         self.test_audio = test_audio
         self.detect_interval = detect_interval
@@ -240,16 +241,17 @@ class StreamingPipeline:
 
     def process_frame(self, frame_bgr, profile=False):
         """Process a single BGR frame through the Wav2Lip pipeline."""
+        t0 = time.perf_counter()
         self.frame_idx += 1
         H, W = frame_bgr.shape[:2]
-        if self.frame_idx <= 3:
-            with open("debug_conn.log", "a") as f:
-                f.write(f"process_frame {self.frame_idx} {W}x{H}\n")
 
         # --- 1. Face detection (skip frames) ---
+        t_detect = 0.0
         do_detect = (self.frame_idx % self.detect_interval == 0) or (self.last_bbox is None)
         if do_detect:
+            t_d0 = time.perf_counter()
             bboxes, kpss, _ = scrfd_detect(self.detector, frame_bgr)
+            t_detect = (time.perf_counter() - t_d0) * 1000
             valid_found = False
             for i, bbox in enumerate(bboxes):
                 kps_i = kpss[i] if i < len(kpss) else None
@@ -302,7 +304,9 @@ class StreamingPipeline:
         if cx2 - cx1 < 10 or cy2 - cy1 < 10:
             return None, None
 
+        t_crop0 = time.perf_counter()
         face_crop = frame_bgr[cy1:cy2, cx1:cx2].copy()
+        t_crop = (time.perf_counter() - t_crop0) * 1000
         crop_h, crop_w = face_crop.shape[:2]
 
         # --- 3. Face alignment (only for 256+ models) ---
@@ -337,24 +341,38 @@ class StreamingPipeline:
                                        interpolation=cv2.INTER_AREA)
             M_inv = None
 
+        t_prep0 = time.perf_counter()
         face_stack = preprocess_face_wav2lip(face_aligned, size=self.size)
+        t_prep = (time.perf_counter() - t_prep0) * 1000
 
         # --- 5. Get mel input ---
+        t_mel0 = time.perf_counter()
         mel_input = torch.from_numpy(self._get_mel_input())
+        t_mel = (time.perf_counter() - t_mel0) * 1000
 
         # --- 6. Wav2Lip inference ---
+        t_infer0 = time.perf_counter()
         with self.wav2lip_lock:
             rendered = self.wav2lip.infer(face_stack.unsqueeze(0), mel_input)
+        t_infer = (time.perf_counter() - t_infer0) * 1000
 
         # --- 7. Restore original face position ---
+        t_post0 = time.perf_counter()
         if M_inv is not None:
-            # Warp rendered back to original crop coordinates
             rendered_unaligned = cv2.warpAffine(rendered, M_inv, (crop_w, crop_h),
                                                   flags=cv2.INTER_LINEAR,
                                                   borderMode=cv2.BORDER_REPLICATE)
-            # Resize to model size for client delta compositing compatibility
             rendered = cv2.resize(rendered_unaligned, (self.size, self.size),
                                     interpolation=cv2.INTER_AREA)
+        t_post = (time.perf_counter() - t_post0) * 1000
+
+        # Profile logging every 30 frames
+        t_total = (time.perf_counter() - t0) * 1000
+        if self.frame_idx <= 10 or self.frame_idx % 30 == 0:
+            with open("debug_pipeline.txt", "a") as df:
+                df.write(f"F{self.frame_idx} TIMING detect={t_detect:.0f}ms crop={t_crop:.1f}ms "
+                         f"prep={t_prep:.1f}ms mel={t_mel:.1f}ms infer={t_infer:.0f}ms "
+                         f"post={t_post:.1f}ms total={t_total:.0f}ms\n")
 
         # Return rendered face + crop coords.
         # Client computes delta = rendered - original_downscaled locally (no clipping).

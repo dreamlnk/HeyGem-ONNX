@@ -12,7 +12,7 @@ from models_wav2lip.wav2lip256 import Wav2Lip256
 
 
 class Wav2LipInferenceEngine:
-    def __init__(self, model_path: str = None, size: int = 96):
+    def __init__(self, model_path: str = None, size: int = 96, use_fp16: bool = True):
         if model_path is None:
             base = os.path.join(os.path.dirname(__file__), "pretrain_models")
             if size == 256:
@@ -29,6 +29,7 @@ class Wav2LipInferenceEngine:
 
         self.size = size
         self.device = torch.device("cuda")
+        self.use_fp16 = use_fp16 and torch.cuda.is_available()
 
         if size == 256:
             self.model = Wav2Lip256().to(self.device).eval()
@@ -42,15 +43,22 @@ class Wav2LipInferenceEngine:
             state = {k.removeprefix("module."): v for k, v in state.items()}
 
         self.model.load_state_dict(state)
-        print(f"[Wav2Lip] Loaded checkpoint from {model_path} (size={size})")
+        if self.use_fp16:
+            self.model = self.model.half()
+            print(f"[Wav2Lip] Loaded checkpoint from {model_path} (size={size}, fp16)")
+        else:
+            print(f"[Wav2Lip] Loaded checkpoint from {model_path} (size={size}, fp32)")
 
         # Pre-allocate static tensors on GPU
-        self._face = torch.empty(1, 6, size, size, device=self.device)
-        self._mel = torch.empty(1, 1, 80, 16, device=self.device)
+        dtype = torch.float16 if self.use_fp16 else torch.float32
+        self._face = torch.empty(1, 6, size, size, device=self.device, dtype=dtype)
+        self._mel = torch.empty(1, 1, 80, 16, device=self.device, dtype=dtype)
 
     def warmup(self, n: int = 3):
-        dummy_face = torch.randn(1, 6, self.size, self.size, device=self.device)
-        dummy_mel = torch.randn(1, 1, 80, 16, device=self.device)
+        dummy_face = torch.randn(1, 6, self.size, self.size, device=self.device,
+                                 dtype=self._face.dtype)
+        dummy_mel = torch.randn(1, 1, 80, 16, device=self.device,
+                                dtype=self._mel.dtype)
         for _ in range(n):
             self.model(dummy_mel, dummy_face)
         torch.cuda.synchronize()
@@ -66,13 +74,17 @@ class Wav2LipInferenceEngine:
             rendered: (S, S, 3) uint8 BGR image
         """
         with torch.no_grad():
-            self._face.copy_(face_stack)
-            self._mel.copy_(mel)
-            out = self.model(self._mel, self._face)  # (1, 3, S, S) [0, 1]
+            if self.use_fp16:
+                self._face.copy_(face_stack.half())
+                self._mel.copy_(mel.half())
+            else:
+                self._face.copy_(face_stack)
+                self._mel.copy_(mel)
+            out = self.model(self._mel, self._face)
 
         out = out.float().cpu().numpy().squeeze(0)
         out = np.clip(out, 0.0, 1.0)
-        out = (out * 255).astype(np.uint8).transpose(1, 2, 0)  # (S, S, 3) BGR
+        out = (out * 255).astype(np.uint8).transpose(1, 2, 0)
         return out
 
 
