@@ -58,11 +58,44 @@ class TCPStreamingClient:
                 time.sleep(2)
         return False
 
-    def _draw_status(self, frame_bgr, text, color=(0, 255, 255)):
-        """Draw status overlay on frame so user always sees what's happening."""
+    def _draw_hud(self, frame_bgr):
+        """Draw semi-transparent HUD at top of frame with all status info."""
         h, w = frame_bgr.shape[:2]
-        cv2.putText(frame_bgr, text, (10, h - 20), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7, color, 2, cv2.LINE_AA)
+        lines = []
+        # Connection + face status
+        if self._detect_status == 'NOCONN':
+            lines.append(("NO CONN", (0, 0, 255)))
+        elif self._detect_status == 'FAIL':
+            lines.append(("NO FACE", (0, 0, 255)))
+        elif self._detect_status == 'OK':
+            lines.append(("FACE OK", (0, 255, 0)))
+        else:
+            lines.append((f"STATUS: {self._detect_status}", (0, 200, 255)))
+        # Mouth delta
+        md = getattr(self, '_mouth_delta', 0)
+        mc = (0, 255, 0) if md > 3 else (0, 200, 255) if md > 1 else (0, 0, 255)
+        lines.append((f"Mouth d: {md:.1f}/255", mc))
+        # FPS / latency
+        if self.latency_history:
+            avg = np.mean(self.latency_history)
+            fps = 1000 / avg if avg > 0 else 0
+            lines.append((f"FPS: {fps:.1f}  Lat: {avg:.0f}ms", (255, 255, 255)))
+        # Frame count
+        lines.append((f"Frame: {self.frame_count}", (200, 200, 200)))
+        # Draw background + text
+        line_h = 22
+        hud_h = len(lines) * line_h + 10
+        overlay = frame_bgr.copy()
+        cv2.rectangle(overlay, (0, 0), (280, hud_h), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.5, frame_bgr, 0.5, 0, frame_bgr)
+        for i, (text, color) in enumerate(lines):
+            y = 20 + i * line_h
+            cv2.putText(frame_bgr, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55, color, 1, cv2.LINE_AA)
+
+    def _draw_status(self, frame_bgr, text, color=(0, 255, 255)):
+        """Set status and draw HUD — legacy wrapper."""
+        self._draw_hud(frame_bgr)
 
     def _send_frame(self, frame_bgr):
         with self.sock_lock:
@@ -91,11 +124,6 @@ class TCPStreamingClient:
                     cv2.rectangle(frame_bgr, (cx1, cy1), (cx2, cy2), (0, 255, 0), 2)
                     self._detect_status = 'OK'
                     frame_bgr = self._composite_face(frame_bgr, rendered, cx1, cy1, cx2, cy2)
-                    # Draw mouth delta value on screen
-                    md = getattr(self, '_mouth_delta', 0)
-                    color = (0, 255, 0) if md > 3 else (0, 200, 255) if md > 1 else (0, 0, 255)
-                    cv2.putText(frame_bgr, f"Mouth d: {md:.1f}/255", (10, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2, cv2.LINE_AA)
                     return frame_bgr
                 self._draw_status(frame_bgr, f"SIZE {result_len}!={expected_len}", (0, 200, 255))
                 self._detect_status = 'SIZE'
@@ -394,7 +422,7 @@ class TCPStreamingClient:
             if self.sock is not None:
                 frame = self._send_frame(frame)
             else:
-                self._draw_status(frame, "NO CONN", (0, 0, 255))
+                self._detect_status = 'NOCONN'
                 if self.frame_count % reconnect_interval == 0:
                     self._connect()
 
@@ -409,6 +437,7 @@ class TCPStreamingClient:
                 md = getattr(self, '_mouth_delta', 0)
                 print(f"\rFPS: {1000/avg:.1f} | 延迟: {avg:.0f}ms | 人脸: {self._detect_status} | 嘴Δ: {md:.1f}/255 | #{self.frame_count}", end="")
 
+            self._draw_hud(frame)
             if cam_output is not None:
                 try:
                     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
