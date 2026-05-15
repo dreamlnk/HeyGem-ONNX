@@ -84,9 +84,9 @@ def _create_feather_mask(h, w, feather_ratio=0.18):
 class StreamingPipeline:
     def __init__(self, detect_interval=3, test_audio=False, size=96, use_align=None):
         self.size = size
-        # Auto-enable alignment for 256, disable for 96
+        # 5-point alignment too crude for any model — disabled by default
         if use_align is None:
-            use_align = (size >= 256)
+            use_align = False
         self.use_align = use_align
         print("=" * 60)
         print(f"Wav2Lip Streaming Pipeline ({size}×{size})")
