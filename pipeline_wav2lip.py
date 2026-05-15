@@ -174,7 +174,11 @@ class StreamingPipeline:
             buf_len = len(self.audio_buffer)
             if buf_len < 3200:  # < 200ms
                 return np.zeros((1, 1, 80, 16), dtype=np.float32)
-            mel = mel_spectrogram(self.audio_buffer)
+            # Only use last 0.5s (8000 samples) for mel — we only need last 16 frames
+            # which correspond to ~0.2s of audio. Full 3s buffer is wasted work.
+            audio_segment = self.audio_buffer[-8000:]
+            buf_len = len(self.audio_buffer)
+        mel = mel_spectrogram(audio_segment)
         mel_input = get_wav2lip_mel_input(mel)
         if self.frame_idx <= 5 or self.frame_idx % 30 == 0:
             with open("debug_pipeline.txt", "a") as df:
@@ -250,7 +254,14 @@ class StreamingPipeline:
         do_detect = (self.frame_idx % self.detect_interval == 0) or (self.last_bbox is None)
         if do_detect:
             t_d0 = time.perf_counter()
-            bboxes, kpss, _ = scrfd_detect(self.detector, frame_bgr)
+            # YuNet on CPU at native resolution is too slow — use fixed 640
+            det_w, det_h = 640, 640
+            det_frame = cv2.resize(frame_bgr, (det_w, det_h), interpolation=cv2.INTER_AREA)
+            bboxes, kpss, _ = scrfd_detect(self.detector, det_frame)
+            # Scale bboxes/keypoints back to original frame coordinates
+            sx, sy = W / det_w, H / det_h
+            bboxes = [np.array([b[0]*sx, b[1]*sy, b[2]*sx, b[3]*sy]) for b in bboxes]
+            kpss = [k * np.array([sx, sy, sx, sy, sx, sy, sx, sy, sx, sy]) for k in kpss]
             t_detect = (time.perf_counter() - t_d0) * 1000
             valid_found = False
             for i, bbox in enumerate(bboxes):

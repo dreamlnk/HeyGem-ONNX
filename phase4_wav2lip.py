@@ -29,7 +29,13 @@ class Wav2LipInferenceEngine:
 
         self.size = size
         self.device = torch.device("cuda")
-        self.use_fp16 = use_fp16 and torch.cuda.is_available()
+        # Pascal (CC < 7.0) has no tensor cores — FP16 is slower than FP32
+        cc = torch.cuda.get_device_capability(0)
+        if use_fp16 and cc[0] < 7:
+            print(f"[Wav2Lip] GPU CC {cc[0]}.{cc[1]} has no tensor cores, forcing fp32")
+            self.use_fp16 = False
+        else:
+            self.use_fp16 = use_fp16 and torch.cuda.is_available()
 
         if size == 256:
             self.model = Wav2Lip256().to(self.device).eval()
