@@ -152,16 +152,15 @@ class TCPStreamingClient:
         self._mouth_delta = mouth_delta
         delta_up = cv2.resize(delta, (crop_w, crop_h), interpolation=cv2.INTER_CUBIC)
         enhanced = orig_crop + delta_up
-        # Mouth-focused mask: fades in at nose, fades out at chin, spares cheeks
+        # Mouth-focused mask: center on mouth, fade at nose/chin, spare extreme cheeks
         yy = np.arange(crop_h, dtype=np.float32).reshape(-1, 1)
-        mouth_center = crop_h * 0.62
-        mouth_half = crop_h * 0.10
+        mouth_center = crop_h * 0.65
+        mouth_half = crop_h * 0.16
         mask = np.exp(-0.5 * ((yy - mouth_center) / mouth_half) ** 2)
-        # Also narrow horizontally (Gaussian window) to spare cheeks
         xx = np.arange(crop_w, dtype=np.float32).reshape(1, -1)
-        mask_h = np.exp(-0.5 * ((xx - crop_w / 2) / (crop_w * 0.28)) ** 2)
+        mask_h = np.exp(-0.5 * ((xx - crop_w / 2) / (crop_w * 0.42)) ** 2)
         mask = mask * mask_h
-        mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=3.0)
+        mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=5.0)
         mask = np.clip(mask, 0, 1)
         blended = enhanced * mask[..., None] + orig_crop * (1 - mask[..., None])
         frame[cy1:cy2, cx1:cx2] = np.clip(blended, 0, 255).astype(np.uint8)
