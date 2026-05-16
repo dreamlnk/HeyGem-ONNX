@@ -129,6 +129,7 @@ class TCPStreamingClient:
                 self._detect_status = 'SIZE'
                 return frame_bgr
             except Exception as e:
+                print(f"\n[连接断开] {e}")
                 self._draw_status(frame_bgr, f"ERR: {str(e)[:40]}", (0, 0, 255))
                 self.sock = None
                 self._detect_status = 'ERR'
@@ -176,7 +177,8 @@ class TCPStreamingClient:
                 self.sock.sendall(hdr + data)
                 if self.frame_count % 30 == 0:
                     print(f"\r  [AUDIO SEND] {len(audio_np)} samples, max={audio_np.max():.3f}", end="")
-            except Exception:
+            except Exception as e:
+                print(f"\n[音频发送失败] {e}")
                 self.sock = None
 
     def _send_reset(self):
@@ -185,7 +187,8 @@ class TCPStreamingClient:
                 return
             try:
                 self.sock.sendall(struct.pack("<BI", 2, 0))
-            except Exception:
+            except Exception as e:
+                print(f"\n[重置发送失败] {e}")
                 self.sock = None
 
     def _recv_exact(self, n):

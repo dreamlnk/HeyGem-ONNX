@@ -29,10 +29,17 @@ def recv_exact(sock, n):
 
 def handle_client(conn, addr, pipeline):
     """Handle a single client connection."""
+    disconnect_reason = "unknown"
     with open(LOG_CONN, "a") as f:
         f.write(f"CONNECTED {addr}\n")
+    # Reset per-client pipeline state
     pipeline.last_bbox = None
     pipeline.last_kps = None
+    pipeline._bbox_history.clear()
+    if hasattr(pipeline, '_kps_history'):
+        pipeline._kps_history.clear()
+    with pipeline.audio_lock:
+        pipeline.audio_buffer = np.array([], dtype=np.float32)
     try:
         while True:
             hdr = recv_exact(conn, 5)
@@ -40,6 +47,7 @@ def handle_client(conn, addr, pipeline):
             payload_len = struct.unpack("<I", hdr[1:5])[0]
 
             if payload_len > 10_000_000:
+                disconnect_reason = f"payload too large: {payload_len}"
                 break
 
             payload = recv_exact(conn, payload_len)
@@ -48,11 +56,12 @@ def handle_client(conn, addr, pipeline):
                 audio_np = np.frombuffer(payload, dtype=np.float32).copy()
                 if len(audio_np) > 0:
                     pipeline.feed_audio(audio_np)
-                    with open(LOG_CONN, "a") as f:
-                        f.write(f"AUDIO {len(audio_np)} max={audio_np.max():.3f}\n")
+                    if pipeline.frame_idx <= 5 or pipeline.frame_idx % 90 == 0:
+                        with open(LOG_CONN, "a") as f:
+                            f.write(f"AUDIO {len(audio_np)} max={audio_np.max():.3f}\n")
                 continue
 
-            elif msg_type == 2:  # 重置
+            elif msg_type == 2:  # Reset
                 pipeline.last_bbox = None
                 pipeline.last_kps = None
                 pipeline._bbox_history.clear()
@@ -64,17 +73,20 @@ def handle_client(conn, addr, pipeline):
 
             elif msg_type == 0:  # Frame
                 if payload_len < 4:
+                    conn.sendall(struct.pack("<I", 0))  # Response: no face
                     continue
                 w = struct.unpack("<H", payload[0:2])[0]
                 h = struct.unpack("<H", payload[2:4])[0]
                 frame_data = payload[4:]
                 expected = w * h * 3
                 if len(frame_data) != expected:
+                    conn.sendall(struct.pack("<I", 0))  # Response: no face
                     continue
 
                 frame = np.frombuffer(frame_data, dtype=np.uint8).reshape(h, w, 3).copy()
-                with open(LOG_CONN, "a") as f:
-                    f.write(f"FRAME {pipeline.frame_idx} {w}x{h}\n")
+                if pipeline.frame_idx <= 5 or pipeline.frame_idx % 90 == 0:
+                    with open(LOG_CONN, "a") as f:
+                        f.write(f"FRAME {pipeline.frame_idx} {w}x{h}\n")
                 rendered_96, coords = pipeline.process_frame(frame)
                 if rendered_96 is not None:
                     cx1, cy1, cx2, cy2 = coords
@@ -84,16 +96,25 @@ def handle_client(conn, addr, pipeline):
                     conn.sendall(struct.pack("<I", len(payload)) + payload)
                 else:
                     conn.sendall(struct.pack("<I", 0))
+            else:
+                # Unknown message type
+                disconnect_reason = f"unknown msg_type: {msg_type}"
+                break
 
-    except (ConnectionError, ConnectionResetError, struct.error):
-        pass
+    except (ConnectionError, ConnectionResetError):
+        disconnect_reason = "client closed connection"
+    except struct.error as e:
+        disconnect_reason = f"protocol error: {e}"
     except Exception as e:
+        disconnect_reason = f"error: {e}"
         import traceback as _tb
         print(f"[错误] {addr}: {e}")
         _tb.print_exc()
     finally:
         conn.close()
-        print(f"[断开] {addr}", flush=True)
+        with open(LOG_CONN, "a") as f:
+            f.write(f"DISCONNECTED {addr} reason={disconnect_reason}\n")
+        print(f"[断开] {addr} ({disconnect_reason})", flush=True)
 
 
 def main():
@@ -131,8 +152,6 @@ def main():
 
     try:
         while True:
-            with open(LOG_CONN, "a") as f:
-                f.write("Waiting for accept...\n")
             try:
                 conn, addr = sock.accept()
             except Exception as e:
