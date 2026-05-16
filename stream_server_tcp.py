@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from pipeline_wav2lip import StreamingPipeline
 
-PORT = 7864
+PORT = 17864
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_CONN = os.path.join(BASE_DIR, "debug_conn.log")
