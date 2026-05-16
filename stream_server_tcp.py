@@ -133,15 +133,23 @@ def main():
         while True:
             with open(LOG_CONN, "a") as f:
                 f.write("Waiting for accept...\n")
-            conn, addr = sock.accept()
+            try:
+                conn, addr = sock.accept()
+            except Exception as e:
+                print(f"[Accept错误] {e}", flush=True)
+                time.sleep(1)
+                continue
             with open(LOG_CONN, "a") as f:
                 f.write(f"ACCEPT {addr}\n")
             t = threading.Thread(target=handle_client, args=(conn, addr, pipeline),
                                  daemon=True)
             t.start()
-            t.join()  # Wait for client to disconnect before accepting next
+            t.join()
     except KeyboardInterrupt:
         print("\n停止服务")
+    except Exception as e:
+        print(f"[服务端崩溃] {e}", flush=True)
+        import traceback; traceback.print_exc()
     finally:
         sock.close()
         pipeline.stop()
