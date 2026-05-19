@@ -11,15 +11,10 @@ from pipeline_wav2lip import StreamingPipeline
 
 
 def load_audio(path, sr=16000):
-    import soundfile as sf
-    audio, fs = sf.read(path)
-    if audio.ndim > 1:
-        audio = audio[:, 0]
-    audio = audio.astype(np.float32)
-    if fs != sr:
-        import librosa
-        audio = librosa.resample(audio, orig_sr=fs, target_sr=sr)
-    return audio
+    """加载音频文件 (支持 wav/mp3/flac 等)"""
+    import librosa
+    audio, fs = librosa.load(path, sr=sr, mono=True)
+    return audio.astype(np.float32)
 
 
 def composite_face(frame, rendered, cx1, cy1, cx2, cy2, size):
