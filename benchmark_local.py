@@ -96,12 +96,18 @@ def main():
     pipeline.start()
     print("管线就绪\n")
 
-    # --- 输出视频 ---
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(args.output, fourcc, fps_video, (vw, vh))
+    # --- 输出视频 (优先H.264兼容编码) ---
+    for codec in ['avc1', 'h264', 'mp4v', 'x264', 'XVID']:
+        fourcc = cv2.VideoWriter_fourcc(*codec)
+        out_ext = 'mp4' if codec in ('avc1', 'h264', 'mp4v', 'x264') else 'avi'
+        output_path = args.output if args.output.endswith('.' + out_ext) else f"{os.path.splitext(args.output)[0]}.{out_ext}"
+        out = cv2.VideoWriter(output_path, fourcc, fps_video, (vw, h))
+        if out.isOpened():
+            print(f"输出: {os.path.basename(output_path)} (编码: {codec})")
+            break
     if not out.isOpened():
-        fourcc = cv2.VideoWriter_fourcc(*'avc1')
-        out = cv2.VideoWriter(args.output, fourcc, fps_video, (vw, vh))
+        print("警告: 无法创建输出视频, 请安装 ffmpeg")
+        out = None
 
     # --- 逐帧处理 ---
     latencies = []
@@ -144,7 +150,8 @@ def main():
             mouth_deltas.append(0)
 
         # 写入输出视频
-        out.write(frame_bgr)
+        if out is not None:
+            out.write(frame_bgr)
 
         # 实时进度
         if frame_idx % 30 == 0 or frame_idx == 1:
@@ -158,7 +165,8 @@ def main():
     print("\n")
 
     # --- 收尾 ---
-    out.release()
+    if out is not None:
+        out.release()
     cap.release()
     pipeline.stop()
 
@@ -185,7 +193,8 @@ def main():
             if silent.any():
                 print(f"  静音帧嘴Δ:    {mds[silent].mean():.1f}/255  ({silent.sum()}帧)")
         print(f"  平均嘴Δ:      {mds.mean():.1f}/255")
-    print(f"  输出视频:     {args.output}")
+    if out is not None:
+        print(f"  输出视频:     {output_path}")
     print("=" * 60)
 
     # GPU信息
