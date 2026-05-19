@@ -180,8 +180,10 @@ def main():
     if len(mds) > 0:
         speaking_frames = mds > 2.0
         if speaking_frames.any():
-            print(f"  说话帧嘴Δ:    {mds[speaking_frames].mean():.1f}/255")
-            print(f"  静音帧嘴Δ:    {mds[~speaking_frames].mean():.1f}/255")
+            print(f"  说话帧嘴Δ:    {mds[speaking_frames].mean():.1f}/255  ({speaking_frames.sum()}帧)")
+            silent = ~speaking_frames
+            if silent.any():
+                print(f"  静音帧嘴Δ:    {mds[silent].mean():.1f}/255  ({silent.sum()}帧)")
         print(f"  平均嘴Δ:      {mds.mean():.1f}/255")
     print(f"  输出视频:     {args.output}")
     print("=" * 60)
