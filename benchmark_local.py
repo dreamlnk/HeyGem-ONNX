@@ -101,7 +101,7 @@ def main():
         fourcc = cv2.VideoWriter_fourcc(*codec)
         out_ext = 'mp4' if codec in ('avc1', 'h264', 'mp4v', 'x264') else 'avi'
         output_path = args.output if args.output.endswith('.' + out_ext) else f"{os.path.splitext(args.output)[0]}.{out_ext}"
-        out = cv2.VideoWriter(output_path, fourcc, fps_video, (vw, h))
+        out = cv2.VideoWriter(output_path, fourcc, fps_video, (vw, vh))
         if out.isOpened():
             print(f"输出: {os.path.basename(output_path)} (编码: {codec})")
             break
