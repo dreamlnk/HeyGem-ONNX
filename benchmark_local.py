@@ -170,6 +170,22 @@ def main():
     cap.release()
     pipeline.stop()
 
+    # --- 合并音频到输出视频 ---
+    final_path = output_path
+    if out is not None and os.path.exists(output_path):
+        import tempfile, subprocess
+        audio_src = args.audio if args.audio else args.video
+        merged = output_path.replace('.mp4', '_audio.mp4').replace('.avi', '_audio.mp4')
+        ret = subprocess.run(
+            f'ffmpeg -y -i "{output_path}" -i "{audio_src}" '
+            f'-c:v copy -c:a aac -shortest -map 0:v:0 -map 1:a:0 '
+            f'"{merged}"',
+            shell=True, capture_output=True, timeout=60)
+        if ret.returncode == 0:
+            import shutil
+            shutil.move(merged, output_path)
+            print(f"  音频已合并到输出视频")
+
     # --- 报告 ---
     lats = np.array(latencies)
     mds = np.array(mouth_deltas)
