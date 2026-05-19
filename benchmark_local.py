@@ -178,7 +178,7 @@ def main():
         merged = output_path.replace('.mp4', '_audio.mp4').replace('.avi', '_audio.mp4')
         ret = subprocess.run(
             f'ffmpeg -y -i "{output_path}" -i "{audio_src}" '
-            f'-c:v copy -c:a aac -shortest -map 0:v:0 -map 1:a:0 '
+            f'-c:v copy -c:a libmp3lame -q:a 2 -shortest -map 0:v:0 -map 1:a:0 '
             f'"{merged}"',
             shell=True, capture_output=True, timeout=60)
         if ret.returncode == 0:
