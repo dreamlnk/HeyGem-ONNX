@@ -71,7 +71,26 @@ def handle_client(conn, addr, pipeline):
                     pipeline.audio_buffer = np.array([], dtype=np.float32)
                 continue
 
-            elif msg_type == 0:  # Frame
+            elif msg_type == 3:  # Frame (JPEG compressed)
+                if payload_len < 4:
+                    conn.sendall(struct.pack("<I", 0))
+                    continue
+                jpeg_len = struct.unpack("<I", payload[:4])[0]
+                if jpeg_len > payload_len - 4 or jpeg_len > 5_000_000:
+                    conn.sendall(struct.pack("<I", 0))
+                    continue
+                jpeg_data = payload[4:4 + jpeg_len]
+                frame = cv2.imdecode(np.frombuffer(jpeg_data, dtype=np.uint8), cv2.IMREAD_COLOR)
+                if frame is None:
+                    conn.sendall(struct.pack("<I", 0))
+                    continue
+                h, w = frame.shape[:2]
+                if pipeline.frame_idx <= 5 or pipeline.frame_idx % 90 == 0:
+                    with open(LOG_CONN, "a") as f:
+                        f.write(f"FRAME_JPEG {pipeline.frame_idx} {w}x{h}\n")
+                rendered_96, coords = pipeline.process_frame(frame)
+
+            elif msg_type == 0:  # Frame (raw BGR, legacy/LAN)
                 if payload_len < 4:
                     conn.sendall(struct.pack("<I", 0))  # Response: no face
                     continue

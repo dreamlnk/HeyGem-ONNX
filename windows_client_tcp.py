@@ -24,7 +24,7 @@ AUDIO_CHUNK_SECONDS = 0.5
 class TCPStreamingClient:
     def __init__(self, video_path=None, use_virtualcam=False, loop=False,
                  use_mic=False, portrait=False, obs_win=False, audio_path=None,
-                 size=96):
+                 size=96, use_jpeg=False, jpeg_quality=80):
         self.running = False
         self.video_path = video_path
         self.audio_path = audio_path
@@ -34,6 +34,8 @@ class TCPStreamingClient:
         self.obs_win = obs_win
         self.portrait = portrait
         self.size = size
+        self.use_jpeg = use_jpeg
+        self.jpeg_quality = jpeg_quality
         self.width = WIDTH
         self.height = HEIGHT
         self._detect_status = '---'
@@ -105,10 +107,17 @@ class TCPStreamingClient:
                 return frame_bgr
             try:
                 h, w = frame_bgr.shape[:2]
-                wh = struct.pack("<HH", w, h)
-                data = wh + frame_bgr.tobytes()
-                hdr = struct.pack("<BI", 0, len(data))
-                self.sock.sendall(hdr + data)
+                if self.use_jpeg:
+                    ok, jpeg = cv2.imencode('.jpg', frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
+                    if not ok:
+                        return frame_bgr
+                    jpeg_bytes = jpeg.tobytes()
+                    data = struct.pack("<I", len(jpeg_bytes)) + jpeg_bytes
+                    hdr = struct.pack("<BI", 3, len(data))
+                else:
+                    wh = struct.pack("<HH", w, h)
+                    data = wh + frame_bgr.tobytes()
+                    hdr = struct.pack("<BI", 0, len(data))
                 result_len = struct.unpack("<I", self._recv_exact(4))[0]
                 if result_len == 0:
                     cv2.line(frame_bgr, (w//2-20, h//2-20), (w//2+20, h//2+20), (0, 0, 255), 2)
@@ -462,6 +471,8 @@ class TCPStreamingClient:
     def start(self):
         print("=" * 50)
         print(f"HeyGem Live TCP Client ({self.size}×{self.size})")
+        mode = "JPEG" if self.use_jpeg else "Raw BGR"
+        print(f"传输: {mode} (Q{self.jpeg_quality})" if self.use_jpeg else f"传输: {mode}")
         print("=" * 50)
         print(f"Server: {WSL_HOST}:{WSL_PORT}")
 
@@ -591,12 +602,17 @@ if __name__ == "__main__":
     parser.add_argument("--camera", type=int, default=0, help="摄像头ID")
     parser.add_argument("--audio", type=str, default=None, help="独立音频文件路径")
     parser.add_argument("--size", type=int, default=96, choices=[96, 256], help="模型分辨率 (默认96)")
+    parser.add_argument("--jpeg", action="store_true", help="JPEG压缩传输 (云端模式必须)")
+    parser.add_argument("--jpeg-quality", type=int, default=80, help="JPEG质量 1-100 (默认80)")
     args = parser.parse_args()
     if args.video:
         CAMERA_ID = None
     else:
         CAMERA_ID = args.camera
+    # Auto-enable JPEG when connecting to non-localhost (cloud mode)
+    use_jpeg = args.jpeg or WSL_HOST not in ("127.0.0.1", "localhost", "0.0.0.0")
     TCPStreamingClient(video_path=args.video, use_virtualcam=args.virtualcam,
                        loop=args.loop, use_mic=args.mic,
                        portrait=args.portrait, audio_path=args.audio,
-                       size=args.size).start()
+                       size=args.size, use_jpeg=use_jpeg,
+                       jpeg_quality=args.jpeg_quality).start()
